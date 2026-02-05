@@ -638,7 +638,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
-        )
+        ) ## fixme k_buffer: [100032, 1, 576]
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper

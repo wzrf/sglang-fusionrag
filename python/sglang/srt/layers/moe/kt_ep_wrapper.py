@@ -1312,11 +1312,11 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
     # Get model config
     hf_config = server_args.get_hf_config()
-    
+
     # fix for kimi-k2.5 models where text_config holds the actual config
     if getattr(hf_config, "text_config", None) is not None:
         hf_config = hf_config.text_config
-    
+
     num_layers = getattr(hf_config, "num_hidden_layers", None)
     # Try different attribute names for num_experts
     num_experts = getattr(hf_config, "num_local_experts", None)
@@ -2161,6 +2161,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             Combined computation results from CPU and GPU experts
         """
+        # print(f"KTEPWrapperMethod apply.")
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )

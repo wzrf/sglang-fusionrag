@@ -106,7 +106,7 @@ class DeepseekMHAForwardMixin:
                     [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                     dim=-1,
                 )
-            )
+            ) ## fixme Q: [seq_len, 1536], latent_cache: [seq_len, 576]
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
@@ -138,7 +138,7 @@ class DeepseekMHAForwardMixin:
                     q_lora = self.q_a_layernorm(q)
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
-                    )
+                    ) ## fixme q_lora,q : [seq_len, 128, 192]
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -183,9 +183,9 @@ class DeepseekMHAForwardMixin:
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) ## fixme q_pe: [seq_len, 128, 64]
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) ## fixme kv_a: [seq_len, 512]
+        latent_cache = latent_cache.unsqueeze(1) ## fixme latent_cache: [seq_len, 1, 576]
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
@@ -205,12 +205,12 @@ class DeepseekMHAForwardMixin:
         else:
             kv_a = self.kv_a_layernorm(kv_a)
 
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :] ## fixme k_pe: [seq_len, 1, 64]
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim :] = q_pe ## fixme q: [seq_len, 128, 192]
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
@@ -230,12 +230,12 @@ class DeepseekMHAForwardMixin:
                 kv_a_quanted,
             )[0]
         else:
-            kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
+            kv = self.kv_b_proj(kv_a)[0] ## fixme kv: [seq_len, 32768]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim) ## fixme kv: [seq_len, 128, 256]
+        k_nope = kv[..., : self.qk_nope_head_dim] ## fixme k_nope: [seq_len, 128, 128]
+        v = kv[..., self.qk_nope_head_dim :] ## fixme v: [seq_len, 128, 128]
 
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch) ## fixme k_nope: [seq_len, 128, 192]
         return q, k, v, forward_batch
 
     def forward_normal_core(

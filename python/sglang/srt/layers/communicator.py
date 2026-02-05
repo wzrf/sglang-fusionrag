@@ -412,12 +412,14 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
+                ## mengyao_debug
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
                         hidden_states, residual
                     )
                 )
             else:
+                ## mengyao_debug
                 if residual is None:
                     residual = hidden_states
 
@@ -483,7 +485,7 @@ class LayerCommunicator:
                             residual,
                             post_residual_addition,
                         )
-
+        ## mengyao_debug
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -524,7 +526,7 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
-
+        ## mengyao_debug
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,

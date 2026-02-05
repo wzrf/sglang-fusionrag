@@ -1177,7 +1177,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim, ## 512+64
             self.scaling,
             num_kv_heads=1,
             layer_id=layer_id,
@@ -1188,7 +1188,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
-            self.qk_nope_head_dim + self.qk_rope_head_dim,
+            self.qk_nope_head_dim + self.qk_rope_head_dim, ## 128+64
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
@@ -2327,14 +2327,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
-
+        ## mengyao_debug
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             quant_format,
         )
-
+        ## mengyao_debug
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2342,7 +2342,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
-
+        ## mengyao_debug
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -2360,7 +2360,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
-
+        ## mengyao_debug
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
@@ -2618,6 +2618,7 @@ class DeepseekV2Model(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
+                #mengyao_debug
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
@@ -2661,6 +2662,7 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
+                ## mengyao_debug
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
@@ -2908,6 +2910,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            ## mengyao_debug
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
