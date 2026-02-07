@@ -238,6 +238,29 @@ class DeepseekMHAForwardMixin:
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch) ## fixme k_nope: [seq_len, 128, 192]
         return q, k, v, forward_batch
 
+    def forward_normal_core_fusionrag(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        scaling: float
+    ):
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        scores = scores * scaling
+
+        mask = torch.triu(torch.ones(q.shape[1], q.shape[1]), diagonal=1).bool().to(q.device)
+        scores = scores.masked_fill(mask.unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+        o = torch.matmul(attn, v.transpose(0, 1))
+        o = o.transpose(0, 1).contiguous()
+        o = o.view(o.shape[0], -1)
+        return o
+
+
     def forward_normal_core(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
@@ -246,6 +269,8 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        if forward_batch.fusion_rag:
+            attn_output_ = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
@@ -388,9 +413,17 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
+            if forward_batch.fusion_rag_indices is None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.attn_mha,
+                    forward_batch.out_cache_loc[forward_batch.fusion_rag_indices],
+                    kv_a[forward_batch.fusion_rag_indices].unsqueeze(1),
+                    k_pe[forward_batch.fusion_rag_indices]
+                )
         elif _is_npu:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(

@@ -866,10 +866,12 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
+        ## fixme: I delete tree cache
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
+                    # key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
                 )

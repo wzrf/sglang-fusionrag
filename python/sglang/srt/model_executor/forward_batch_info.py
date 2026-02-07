@@ -375,6 +375,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    reqs: Optional[list] = None
+    fusion_rag: Optional[bool] = None
+    fusion_rag_indices: Optional[torch.Tensor] = None
+
+
     @classmethod
     def init_new(
         cls,
@@ -419,6 +424,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            reqs=batch.reqs,
         )
         device = model_runner.device
 

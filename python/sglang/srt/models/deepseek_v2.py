@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-
+import hashlib, json, copy
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -116,7 +116,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors, ForwardMode
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -2571,6 +2571,9 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
+        self.cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/raw_kv_cache"
+        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2645,6 +2648,10 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
+        self.load_kv_cache_to_hbm(forward_batch=forward_batch,
+                                  dtype=hidden_states.dtype,
+                                  device=hidden_states.device,
+                                    positions=positions)
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2672,6 +2679,12 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+
+        self.save_kv_cache_to_disk(
+            forward_batch,
+            dtype=hidden_states.dtype,
+            positions=positions
+        )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2712,6 +2725,101 @@ class DeepseekV2Model(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def save_kv_cache_to_disk(
+        self,
+        forward_batch,
+        dtype,
+        positions,
+    ):
+        if forward_batch.extend_seq_lens_cpu is not None:
+            for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
+                kv_cache = []
+                text = forward_batch.reqs[i].origin_input_text
+                if forward_batch.reqs[i].sampling_params is not None and forward_batch.reqs[i].sampling_params.max_new_tokens == 0:
+                    md5_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+                    cache_start_idx = sum(forward_batch.extend_seq_lens_cpu[:i])
+                    cache_end_idx = sum(forward_batch.extend_seq_lens_cpu[:i+1])
+                    for layer_id in range(len(self.layers)):
+                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id).to(
+                            dtype
+                        )[forward_batch.out_cache_loc[cache_start_idx: cache_end_idx], :, :].to('cpu')
+                        kv_cache.append(k_buffer)
+                    kv_cache = torch.stack(kv_cache, dim=0)
+                    passage_kv_path = f"{self.cache_path}/{md5_hash}"
+                    os.makedirs(passage_kv_path, exist_ok=True)
+                    metadata = {
+                        "text": text,
+                    }
+                    metadata_file_path = f"{passage_kv_path}/metadata.json"
+                    with open(metadata_file_path, 'w') as f:
+                        json.dump(metadata, f)
+                    torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
+
+        ""
+
+    def load_kv_cache_to_hbm(
+        self,
+        forward_batch,
+        device,
+        dtype,
+        positions,
+    ):
+        def random_select_1d(tensor: torch.Tensor):
+            num_samples = int(0 * len(tensor))
+            indices = torch.randperm(len(tensor))[:num_samples]
+            return indices
+
+        kv_cache = []
+        ## starts from the easy case
+        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
+            if forward_batch.forward_mode == ForwardMode.EXTEND and forward_batch.reqs[0].sampling_params.max_new_tokens != 0: ## this is a generation task, and it's in prefill mode
+                input_text = copy.deepcopy(forward_batch.reqs[0].origin_input_text)
+                all_chunk_cache = self.list_all_chunk_caches()
+                found_prefix_chunk = True
+                out_cache_loc_start_idx = 0
+                out_cache_loc_end_idx = 0
+                while found_prefix_chunk and len(input_text) > 0:
+                    found_prefix_chunk = False
+                    for cache in all_chunk_cache:
+                        chunk_text = cache[0]
+                        kv_cache_pt = cache[1]
+                        if input_text.startswith(chunk_text):
+                            found_prefix_chunk = True
+                            chunk_tensor = torch.load(kv_cache_pt, weights_only=True).to(device)
+                            out_cache_loc_end_idx += chunk_tensor.shape[1]
+                            for i, layer in enumerate(self.layers):
+                                k, k_rope = chunk_tensor[i].split([512, 64], dim=-1)
+                                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                                    layer.self_attn.attn_mha,
+                                    forward_batch.out_cache_loc[out_cache_loc_start_idx: out_cache_loc_end_idx],
+                                    k,
+                                    k_rope,
+                                )
+
+                            print(f"loaded one text, text={chunk_text}")
+                            out_cache_loc_start_idx = out_cache_loc_end_idx
+                            input_text = input_text[len(chunk_text):]
+                forward_batch.fusion_rag_indices = random_select_1d(forward_batch.out_cache_loc)
+
+    def list_all_chunk_caches(self):
+        result = []
+        for folder in os.listdir(self.cache_path):
+            folder_path = os.path.join(self.cache_path, folder)
+            if os.path.isdir(folder_path):
+                metadata_path = os.path.join(folder_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path, 'r', encoding='utf-8') as f:
+                            metadata = json.load(f)
+                        text = metadata.get("text", "")
+                        result.append((text, os.path.join(folder_path, f"{folder}.pt")))
+
+                    except (json.JSONDecodeError, KeyError) as e:
+                        print(f"Error reading {metadata_path}: {e}")
+
+        return result
+
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
