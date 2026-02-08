@@ -1317,6 +1317,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        origin_positions=None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -1324,6 +1325,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
+            origin_positions=origin_positions,
         )
         return self.forward_core(s)
 
@@ -1334,6 +1336,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        origin_positions=None
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1369,7 +1372,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states, forward_batch, zero_allocator, origin_positions
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
@@ -2300,6 +2303,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        origin_positions=None
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -2341,6 +2345,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
+            origin_positions=origin_positions,
         )
         ## mengyao_debug
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -2618,6 +2623,7 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        hidden_states_origin_shape = hidden_states.shape
 
         if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
@@ -2648,10 +2654,15 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        self.load_kv_cache_to_hbm(forward_batch=forward_batch,
+        new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
                                   dtype=hidden_states.dtype,
                                   device=hidden_states.device,
                                     positions=positions)
+        origin_positions = None
+        if new_positions is not None:
+            origin_positions = copy.deepcopy(positions)
+            positions = new_positions
+            hidden_states = hidden_states[positions]
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2678,6 +2689,7 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
+                    origin_positions
                 )
 
         self.save_kv_cache_to_disk(
@@ -2722,6 +2734,10 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        if forward_batch.fusion_rag_indices is not None:
+            hidden_states_full = torch.rand(hidden_states_origin_shape, dtype=hidden_states.dtype).to(hidden_states.device)
+            hidden_states_full[forward_batch.fusion_rag_indices] = hidden_states
+            hidden_states = hidden_states_full
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -2732,29 +2748,35 @@ class DeepseekV2Model(nn.Module):
         dtype,
         positions,
     ):
-        if forward_batch.extend_seq_lens_cpu is not None:
-            for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
-                kv_cache = []
-                text = forward_batch.reqs[i].origin_input_text
-                if forward_batch.reqs[i].sampling_params is not None and forward_batch.reqs[i].sampling_params.max_new_tokens == 0:
-                    md5_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-                    cache_start_idx = sum(forward_batch.extend_seq_lens_cpu[:i])
-                    cache_end_idx = sum(forward_batch.extend_seq_lens_cpu[:i+1])
-                    for layer_id in range(len(self.layers)):
-                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id).to(
-                            dtype
-                        )[forward_batch.out_cache_loc[cache_start_idx: cache_end_idx], :, :].to('cpu')
-                        kv_cache.append(k_buffer)
-                    kv_cache = torch.stack(kv_cache, dim=0)
-                    passage_kv_path = f"{self.cache_path}/{md5_hash}"
-                    os.makedirs(passage_kv_path, exist_ok=True)
-                    metadata = {
-                        "text": text,
-                    }
-                    metadata_file_path = f"{passage_kv_path}/metadata.json"
-                    with open(metadata_file_path, 'w') as f:
-                        json.dump(metadata, f)
-                    torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
+        if forward_batch.forward_mode == ForwardMode.EXTEND: ## only do this in prefill mode
+            if forward_batch.extend_seq_lens_cpu is not None:
+                for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
+                    kv_cache = []
+                    text = forward_batch.reqs[i].origin_input_text
+                    if forward_batch.reqs[i].fusionrag_params is not None and forward_batch.reqs[i].fusionrag_params.get("save_cache", False) is True:
+                        md5_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+                        cache_start_idx = sum(forward_batch.extend_seq_lens_cpu[:i])
+                        cache_end_idx = sum(forward_batch.extend_seq_lens_cpu[:i+1])
+                        cache_prefix_token_len = len(forward_batch.reqs[i].fusionrag_params["prefix_prompt_ids"])
+                        prefix_prompt = forward_batch.reqs[i].fusionrag_params.get("prefix_prompt", "")
+                        for layer_id in range(len(self.layers)):
+                            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id).to(
+                                dtype
+                            )[forward_batch.out_cache_loc[cache_start_idx+cache_prefix_token_len: cache_end_idx], :, :].to('cpu')
+                            kv_cache.append(k_buffer)
+                        kv_cache = torch.stack(kv_cache, dim=0)
+                        passage_kv_path = f"{self.cache_path}/{md5_hash}"
+                        os.makedirs(passage_kv_path, exist_ok=True)
+                        if not text.startswith(forward_batch.reqs[i].fusionrag_params["prefix_prompt"]):
+                            print(f"mengyao_debug not start with prefix!\nprefix={forward_batch.reqs[i].fusionrag_params['prefix_prompt']}\ntext={text}")
+                        metadata = {
+                            "text": text[len(prefix_prompt):],
+                            "cache_prefix_token_len": cache_prefix_token_len,
+                        }
+                        metadata_file_path = f"{passage_kv_path}/metadata.json"
+                        with open(metadata_file_path, 'w') as f:
+                            json.dump(metadata, f)
+                        torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
 
         ""
 
@@ -2764,10 +2786,13 @@ class DeepseekV2Model(nn.Module):
         device,
         dtype,
         positions,
-    ):
+    ) -> torch.Tensor:
         def random_select_1d(tensor: torch.Tensor):
-            num_samples = int(0 * len(tensor))
-            indices = torch.randperm(len(tensor))[:num_samples]
+            num_samples = int(0.5 * len(tensor))
+            indices = torch.randperm(len(tensor))[:num_samples].sort().values
+            if indices[-1] != len(tensor) - 1:
+                last_index = torch.tensor([len(tensor) - 1])
+                indices = torch.cat([indices, last_index])
             return indices
 
         kv_cache = []
@@ -2784,6 +2809,7 @@ class DeepseekV2Model(nn.Module):
                     for cache in all_chunk_cache:
                         chunk_text = cache[0]
                         kv_cache_pt = cache[1]
+                        cache_prefix_token_len = cache[2]
                         if input_text.startswith(chunk_text):
                             found_prefix_chunk = True
                             chunk_tensor = torch.load(kv_cache_pt, weights_only=True).to(device)
@@ -2800,7 +2826,16 @@ class DeepseekV2Model(nn.Module):
                             print(f"loaded one text, text={chunk_text}")
                             out_cache_loc_start_idx = out_cache_loc_end_idx
                             input_text = input_text[len(chunk_text):]
-                forward_batch.fusion_rag_indices = random_select_1d(forward_batch.out_cache_loc)
+                if len(input_text) == len(forward_batch.reqs[0].origin_input_text):
+                    ## match nothing.
+                    return None
+                sorted_indices = random_select_1d(forward_batch.out_cache_loc)
+                forward_batch.fusion_rag_indices = sorted_indices
+                return sorted_indices
+            else:
+                return None
+        else:
+            return None
 
     def list_all_chunk_caches(self):
         result = []
@@ -2813,7 +2848,8 @@ class DeepseekV2Model(nn.Module):
                         with open(metadata_path, 'r', encoding='utf-8') as f:
                             metadata = json.load(f)
                         text = metadata.get("text", "")
-                        result.append((text, os.path.join(folder_path, f"{folder}.pt")))
+                        cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
+                        result.append((text, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len))
 
                     except (json.JSONDecodeError, KeyError) as e:
                         print(f"Error reading {metadata_path}: {e}")
@@ -3087,3 +3123,59 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+
+def correct_rope_rotation(q_wrong, k_wrong, rotary_cache, wrong_positions, correct_positions):
+    """
+    修正错误的RoPE旋转
+    q_wrong, k_wrong: 已经用wrong_positions旋转过的张量 [seq_len, num_heads, head_dim]
+    rotary_cache: [max_position, head_dim]，前一半是cos，后一半是sin
+    wrong_positions: 之前错误使用的位置 [5,6,7,8]
+    correct_positions: 正确的位置 [2,3,4,5]
+
+    返回: 修正后的q_correct, k_correct
+    """
+    seq_len, num_heads, head_dim = q_wrong.shape
+    _, num_heads_k, _ = k_wrong.shape
+    half_dim = head_dim // 2
+
+    # 1. 获取错误位置的cos/sin
+    wrong_cache = rotary_cache[wrong_positions]  # [4, 64]
+    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1)  # [4, 1, 32]
+    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1)  # [4, 1, 32]
+
+    # 2. 获取正确位置的cos/sin
+    correct_cache = rotary_cache[correct_positions]  # [4, 64]
+    cos_correct = correct_cache[:, :half_dim].unsqueeze(1)  # [4, 1, 32]
+    sin_correct = correct_cache[:, half_dim:].unsqueeze(1)  # [4, 1, 32]
+
+    # 3. 计算旋转差值的cos/sin
+    # cos(Δθ) = cos(θ_correct - θ_wrong) = cos_correct*cos_wrong + sin_correct*sin_wrong
+    # sin(Δθ) = sin(θ_correct - θ_wrong) = sin_correct*cos_wrong - cos_correct*sin_wrong
+    cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong  # [4, 1, 32]
+    sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong  # [4, 1, 32]
+
+    # 4. 将q_wrong/k_wrong重塑为[..., 32, 2]
+    q_reshaped = q_wrong.view(seq_len, num_heads, half_dim, 2)
+    k_reshaped = k_wrong.view(seq_len, num_heads_k, half_dim, 2)
+
+    # 5. 分离偶数和奇数维度
+    q_even = q_reshaped[..., 0]  # x_wrong
+    q_odd = q_reshaped[..., 1]  # y_wrong
+    k_even = k_reshaped[..., 0]
+    k_odd = k_reshaped[..., 1]
+
+    # 6. 应用修正旋转：用Δθ旋转当前向量
+    # x_correct = x_wrong * cos(Δθ) - y_wrong * sin(Δθ)
+    # y_correct = x_wrong * sin(Δθ) + y_wrong * cos(Δθ)
+    q_correct_even = q_even * cos_delta - q_odd * sin_delta
+    q_correct_odd = q_even * sin_delta + q_odd * cos_delta
+
+    k_correct_even = k_even * cos_delta - k_odd * sin_delta
+    k_correct_odd = k_even * sin_delta + k_odd * cos_delta
+
+    # 7. 重新组合
+    q_correct = torch.stack([q_correct_even, q_correct_odd], dim=-1)
+    k_correct = torch.stack([k_correct_even, k_correct_odd], dim=-1)
+
+    return (q_correct.view(seq_len, num_heads, head_dim).to(q_wrong.dtype),
+            k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype))

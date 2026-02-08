@@ -91,12 +91,49 @@ class DeepseekMHAForwardMixin:
             envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
+    def apply_rope_compact(self, q, k, rotary_cache, positions):
+        """
+        正确的RoPE实现 - 相邻配对旋转
+        q, k: [seq_len, num_heads, head_dim] = [100, 128, 64]
+        rotary_cache: [max_position, head_dim] = [10000, 64]，前32维是cos，后32是sin
+        """
+        seq_len, num_heads, head_dim = q.shape
+        seq_len, num_heads_k, head_dim = k.shape
+
+        # 1. 取出当前位置的cos和sin缓存
+        cache = rotary_cache[positions]  # [100, 64]
+        cos = cache[:, :head_dim // 2].unsqueeze(1)  # [100, 1, 32]
+        sin = cache[:, head_dim // 2:].unsqueeze(1)  # [100, 1, 32]
+
+        # 2. 将q/k重塑为[..., 32, 2]，实现相邻配对
+        # 原始: [100, 128, 64] → 重塑后: [100, 128, 32, 2]
+        q_reshaped = q.view(q.shape[0], q.shape[1], head_dim // 2, 2)
+        k_reshaped = k.view(k.shape[0], k.shape[1], head_dim // 2, 2)
+
+        q_even = q_reshaped[..., 0]
+        q_odd = q_reshaped[..., 1]
+        k_even = k_reshaped[..., 0]
+        k_odd = k_reshaped[..., 1]
+
+        q_rotated_even = q_even * cos - q_odd * sin
+        q_rotated_odd = q_even * sin + q_odd * cos
+
+        k_rotated_even = k_even * cos - k_odd * sin
+        k_rotated_odd = k_even * sin + k_odd * cos
+
+        # 5. 重新组合成[100, 128, 64]
+        q_rotated = torch.stack([q_rotated_even, q_rotated_odd], dim=-1)
+        k_rotated = torch.stack([k_rotated_even, k_rotated_odd], dim=-1)
+
+        return q_rotated.view(seq_len, num_heads, head_dim).to(q.dtype), k_rotated.view(seq_len, num_heads_k, head_dim).to(k.dtype)
+
     def forward_normal_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        origin_positions: torch.Tensor,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -184,8 +221,20 @@ class DeepseekMHAForwardMixin:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) ## fixme q_pe: [seq_len, 128, 64]
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) ## fixme kv_a: [seq_len, 512]
-        latent_cache = latent_cache.unsqueeze(1) ## fixme latent_cache: [seq_len, 1, 576]
+        ## latent cache is wrong here.
+        if forward_batch.fusion_rag_indices is not None: ## we are doing fusion rag
+            # we load from kv cache rather than using the generate KV
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
+                latent_cache.dtype
+            )[forward_batch.out_cache_loc, :, :].to(latent_cache.device)
+            latent_cache = latent_cache.unsqueeze(1)
+            k_buffer[positions] = latent_cache ## positions should be the same as forward_batch.fusion_rag_indices
+            latent_cache = k_buffer
+            kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_a = kv_a.squeeze(1)
+        else:
+            kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) ## fixme kv_a: [seq_len, 512]
+            latent_cache = latent_cache.unsqueeze(1) ## fixme latent_cache: [seq_len, 1, 576]
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
@@ -207,7 +256,22 @@ class DeepseekMHAForwardMixin:
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :] ## fixme k_pe: [seq_len, 1, 64]
         if self.rotary_emb is not None:
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if forward_batch.fusion_rag_indices is not None:
+                # seq_len = k_pe.shape[0]
+                fake_q = torch.zeros(k_pe.shape[0], q_pe.shape[1], q_pe.shape[2], dtype=q_pe.dtype).to(q_pe.device)
+                fake_q[positions] = q_pe
+                fake_q, k_pe = self.rotary_emb(origin_positions, fake_q, k_pe)
+                q_pe = fake_q[positions]
+            else:
+                q_pe_, k_pe_ = self.apply_rope_compact(q_pe, k_pe, self.rotary_emb.cos_sin_cache, positions)
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                torch.set_printoptions(
+                    profile='full',  # 完整显示，不会截断
+                    linewidth=200,  # 每行显示200个字符（防止自动换行太频繁）
+                    precision=4,  # 小数点后4位
+                    threshold=2000000  # 触发汇总显示的阈值（设为最大整数，永不触发）
+                )
+                print(f"rotary_emb_k_pe: {torch.eq(k_pe, k_pe_)}")
         q[..., self.qk_nope_head_dim :] = q_pe ## fixme q: [seq_len, 128, 192]
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
@@ -246,13 +310,18 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         scaling: float
     ):
+        seq_len_q = q.shape[0]
+        seq_len = k.shape[0]
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         scores = torch.matmul(q, k.transpose(-2, -1))
         scores = scores * scaling
 
-        mask = torch.triu(torch.ones(q.shape[1], q.shape[1]), diagonal=1).bool().to(q.device)
-        scores = scores.masked_fill(mask.unsqueeze(0), float('-inf'))
+        mask = torch.zeros(seq_len_q, seq_len, dtype=torch.bool).to(scores.device)
+        for i, q_idx in enumerate(forward_batch.fusion_rag_indices):
+            mask[i, q_idx + 1:] = True  # True表示要mask掉的位置
+
+        scores = scores.masked_fill(mask, float('-inf'))
 
         attn = torch.softmax(scores, dim=-1)
         o = torch.matmul(attn, v.transpose(0, 1))
@@ -268,9 +337,10 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        if forward_batch.fusion_rag:
-            attn_output_ = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling)
+        if forward_batch.fusion_rag_indices is not None:
+            attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling)
+        else:
+            attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
@@ -335,10 +405,11 @@ class DeepseekMHAForwardMixin:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        origin_positions: torch.Tensor,
     ):
         forward_batch.mha_one_shot = True
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions, hidden_states, forward_batch, zero_allocator, origin_positions
         )
 
     def forward_normal_one_shot_core(

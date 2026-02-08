@@ -270,6 +270,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
+    fusionrag_params: Optional[Dict] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -760,6 +761,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+    fusionrag_params: Optional[Dict] = None
 
 
 @dataclass

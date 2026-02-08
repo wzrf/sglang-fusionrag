@@ -694,6 +694,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
             )
+            if obj.fusionrag_params is not None and "prefix_prompt" in obj.fusionrag_params:
+                prefix_prompt_ids, _ = await self._tokenize_texts(
+                    obj.fusionrag_params["prefix_prompt"], is_cross_encoder_request
+                )
+                obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -943,6 +948,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                fusionrag_params=obj.fusionrag_params,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

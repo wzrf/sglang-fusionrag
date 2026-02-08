@@ -271,6 +271,7 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    fusionrag_params: Optional[Dict] = None
 
     @field_validator("max_tokens")
     @classmethod
