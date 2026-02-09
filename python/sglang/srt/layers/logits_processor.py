@@ -437,7 +437,7 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
-            pruned_states = hidden_states[last_index]
+            pruned_states = hidden_states[last_index] ##
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:

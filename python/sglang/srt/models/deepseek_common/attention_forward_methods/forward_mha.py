@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-
+from contextlib import contextmanager
 import torch
 
 from sglang.srt.environ import envs
@@ -263,15 +263,8 @@ class DeepseekMHAForwardMixin:
                 fake_q, k_pe = self.rotary_emb(origin_positions, fake_q, k_pe)
                 q_pe = fake_q[positions]
             else:
-                q_pe_, k_pe_ = self.apply_rope_compact(q_pe, k_pe, self.rotary_emb.cos_sin_cache, positions)
+                # q_pe_, k_pe_ = self.apply_rope_compact(q_pe, k_pe, self.rotary_emb.cos_sin_cache, positions)
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-                torch.set_printoptions(
-                    profile='full',  # 完整显示，不会截断
-                    linewidth=200,  # 每行显示200个字符（防止自动换行太频繁）
-                    precision=4,  # 小数点后4位
-                    threshold=2000000  # 触发汇总显示的阈值（设为最大整数，永不触发）
-                )
-                print(f"rotary_emb_k_pe: {torch.eq(k_pe, k_pe_)}")
         q[..., self.qk_nope_head_dim :] = q_pe ## fixme q: [seq_len, 128, 192]
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
@@ -302,6 +295,29 @@ class DeepseekMHAForwardMixin:
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch) ## fixme k_nope: [seq_len, 128, 192]
         return q, k, v, forward_batch
 
+    def forward_normal_core_fusionrag_(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        scaling: float
+    ):
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        scores = scores * scaling
+
+        mask = torch.triu(torch.ones(q.shape[1], q.shape[1]), diagonal=1).bool().to(q.device)
+        scores = scores.masked_fill(mask.unsqueeze(0), float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        o = torch.matmul(attn, v.transpose(0, 1))
+        o = o.transpose(0, 1).contiguous()
+        o = o.view(o.shape[0], -1)
+        return o
+
+
     def forward_normal_core_fusionrag(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
@@ -318,8 +334,12 @@ class DeepseekMHAForwardMixin:
         scores = scores * scaling
 
         mask = torch.zeros(seq_len_q, seq_len, dtype=torch.bool).to(scores.device)
-        for i, q_idx in enumerate(forward_batch.fusion_rag_indices):
-            mask[i, q_idx + 1:] = True  # True表示要mask掉的位置
+        if forward_batch.fusion_rag_indices is not None:
+            for i, q_idx in enumerate(forward_batch.fusion_rag_indices):
+                mask[i, q_idx + 1:] = True  # True表示要mask掉的位置
+        else:
+            for i in range(seq_len_q):
+                mask[i, i + 1:] = True  # True表示要mask掉的位置
 
         scores = scores.masked_fill(mask, float('-inf'))
 
@@ -337,11 +357,22 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        @contextmanager
+        def print_options(**kwargs):
+            torch.set_printoptions(**kwargs)
         if forward_batch.fusion_rag_indices is not None:
             attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling)
         else:
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            attn_output_ = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling)
+            attn_output__ = self.forward_normal_core_fusionrag_(q, k, v, forward_batch, self.attn_mha.scaling)
+            print(f"mengyao_debug forward_normal_core attn_output={attn_output[1][:4096]}")
+            print(f"mengyao_debug forward_normal_core attn_output_={attn_output_[1][:4096]}")
+            print(f"mengyao_debug forward_normal_core attn_output__={attn_output__[1][:4096]}")
+            print(f"mengyao_debug diff {torch.nonzero(attn_output != attn_output_)[:100]}")
+            print(f"mengyao_debug diff {torch.nonzero(attn_output != attn_output__)[:100]}")
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        # print(f"mengyao_debug forward_normal_core attn_output={attn_output[-1][:5]}")
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -419,6 +450,9 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        print(f"mengyao_debug forward_normal_one_shot_core q={q[-1][0][:5]}")
+        print(f"mengyao_debug forward_normal_one_shot_core k={k[-1][0][:5]}")
+        print(f"mengyao_debug forward_normal_one_shot_core v={v[-1][0][:5]}")
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
