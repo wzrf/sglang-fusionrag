@@ -1327,6 +1327,21 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     if is_fusionrag_load_cache(forward_batch):
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_q_{self.layer_id}.pt"
+        #         torch.save(s[3][0], save_path)
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_k_{self.layer_id}.pt"
+        #         torch.save(s[3][1], save_path)
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_v_{self.layer_id}.pt"
+        #         torch.save(s[3][2], save_path)
+        #     else:
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_q_{self.layer_id}.pt"
+        #         torch.save(s[3][0], save_path)
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_k_{self.layer_id}.pt"
+        #         torch.save(s[3][1], save_path)
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_v_{self.layer_id}.pt"
+        #         torch.save(s[3][2], save_path)
         return self.forward_core(s)
 
     def forward_prepare(
@@ -2305,6 +2320,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         origin_positions=None
     ) -> torch.Tensor:
+
+
         quant_format = (
             "mxfp4"
             if (
@@ -2338,7 +2355,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             quant_format,
         )
-        print(f"mengyao_debug prepare_attn hidden_states={hidden_states[-1][:5]}")
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     if is_fusionrag_load_cache(forward_batch):
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_prepare_attn_hidden_states_{self.layer_id}.pt"
+        #     else:
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_attn_hidden_states_{self.layer_id}.pt"
+        #     torch.save(hidden_states, save_path)
+
+
+        # print(f"mengyao_debug prepare_attn hidden_states={hidden_states[-1][:5]}")
         ## mengyao_debug
         hidden_states = self.self_attn(
             positions=positions,
@@ -2348,12 +2373,23 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
-        print(f"mengyao_debug self_attn hidden_states={hidden_states[-1][:5]}")
-        ## mengyao_debug
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     if is_fusionrag_load_cache(forward_batch):
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_attn_hidden_states_{self.layer_id}.pt"
+        #     else:
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_attn_hidden_states_{self.layer_id}.pt"
+        #     torch.save(hidden_states, save_path)
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        print(f"mengyao_debug prepare_mlp hidden_states={hidden_states[-1][:5]}")
+
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     if is_fusionrag_load_cache(forward_batch):
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_prepare_mlp_hidden_states_{self.layer_id}.pt"
+        #     else:
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_mlp_hidden_states_{self.layer_id}.pt"
+        #     torch.save(hidden_states, save_path)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2376,7 +2412,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
-        print(f"mengyao_debug mlp hidden_states={hidden_states[-1][:5]}")
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     if is_fusionrag_load_cache(forward_batch):
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_mlp_hidden_states_{self.layer_id}.pt"
+        #     else:
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_mlp_hidden_states_{self.layer_id}.pt"
+        #     torch.save(hidden_states, save_path)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2695,8 +2736,8 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     origin_positions
                 )
-                print(f"mengyao_debug hidden_states shape={hidden_states.shape}")
-                print(f"mengyao_debug hidden_states {hidden_states[-1][:5]}")
+                # print(f"mengyao_debug hidden_states shape={hidden_states.shape}")
+                # print(f"mengyao_debug hidden_states {hidden_states[-1][:5]}")
 
         self.save_kv_cache_to_disk(
             forward_batch,
@@ -2825,7 +2866,7 @@ class DeepseekV2Model(nn.Module):
                             for i, layer in enumerate(self.layers):
                                 k, k_rope = chunk_tensor[i].split([512, 64], dim=-1)
                                 if forward_batch.reqs[0].fusionrag_params.get("rope", False) is True:
-                                    print(f"doing rope")
+                                    # print(f"doing rope")
                                     k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
                                                           wrong_positions=prev_pos, correct_positions=cur_pos)
                                 forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -3189,3 +3230,11 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     k_correct = torch.stack([k_correct_even, k_correct_odd], dim=-1)
 
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
+
+
+def is_fusionrag_load_cache(forward_batch: ForwardBatch) -> bool:
+    if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
+        if forward_batch.forward_mode == ForwardMode.EXTEND and forward_batch.reqs[
+            0].sampling_params.max_new_tokens != 0:
+            return True
+    return False
