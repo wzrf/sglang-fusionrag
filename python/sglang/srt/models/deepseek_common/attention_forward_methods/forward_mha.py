@@ -261,13 +261,7 @@ class DeepseekMHAForwardMixin:
         k_pe = latent_cache[:, :, self.kv_lora_rank :] ## fixme k_pe: [seq_len, 1, 64]
         if self.rotary_emb is not None:
             if forward_batch.fusion_rag_indices is not None:
-                # seq_len = k_pe.shape[0]
-                fake_q = torch.zeros(k_pe.shape[0], q_pe.shape[1], q_pe.shape[2], dtype=q_pe.dtype).to(q_pe.device)
-                fake_q[positions] = q_pe
-                fake_k = copy.deepcopy(k_pe) ## fixme: k_pe is already computed.
-                fake_q, fake_k = self.rotary_emb(origin_positions, fake_q, fake_k)
-                q_pe = fake_q[positions]
-                k_pe[positions] = fake_k[positions]
+                q_pe, k_pe[positions] = self.rotary_emb(positions, q_pe, k_pe[positions])
             else:
                 # q_pe_, k_pe_ = self.apply_rope_compact(q_pe, k_pe, self.rotary_emb.cos_sin_cache, positions)
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -403,9 +397,6 @@ class DeepseekMHAForwardMixin:
             q1 = copy.deepcopy(q)
             k1 = copy.deepcopy(k)
             v1 = copy.deepcopy(v)
-            q2 = copy.deepcopy(q)
-            k2 = copy.deepcopy(k)
-            v2 = copy.deepcopy(v)
             attn_output_ = self.forward_normal_core_fusionrag(q1.to(torch.float32), k1.to(torch.float32), v1.to(torch.float32), forward_batch, self.attn_mha.scaling).to(attn_output.dtype)
             # attn_output__ = self.forward_normal_core_fusionrag_(q2.to(torch.float32), k2.to(torch.float32), v2.to(torch.float32), forward_batch, self.attn_mha.scaling).to(attn_output.dtype)
             # print(f"mengyao_debug diff1 {torch.nonzero(attn_output != attn_output_)[:100]}")

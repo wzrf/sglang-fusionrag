@@ -2534,7 +2534,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        config.num_hidden_layers = 5
+        # config.num_hidden_layers = 5
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -2669,6 +2669,8 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
         hidden_states_origin_shape = hidden_states.shape
+        if self.check_if_cache_calculated_before(forward_batch):
+            return hidden_states
 
         if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
@@ -2706,7 +2708,7 @@ class DeepseekV2Model(nn.Module):
         origin_positions = None
         if new_positions is not None:
             origin_positions = copy.deepcopy(positions)
-            positions = new_positions
+            positions = new_positions.to(positions.device)
             hidden_states = hidden_states[positions]
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -2789,6 +2791,31 @@ class DeepseekV2Model(nn.Module):
             return hidden_states
         return hidden_states, aux_hidden_states
 
+    def check_if_cache_calculated_before(self, forward_batch):
+        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
+            if forward_batch.forward_mode == ForwardMode.EXTEND \
+            and forward_batch.reqs[0].fusionrag_params is not None \
+            and forward_batch.reqs[0].fusionrag_params.get("save_cache", False) is True: ## only happens when compute and save cache.
+                text = forward_batch.reqs[0].origin_input_text
+                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
+                if forward_batch.reqs[0].fusionrag_params.get("save_preprocess_cache", False) is True:
+                    raw_cache = False
+                else:
+                    raw_cache = True
+                all_chunk_cache = self.list_all_chunk_caches(raw_cache=raw_cache)
+                all_texts = [
+                    cache[0] for cache in all_chunk_cache
+                ]
+                if text[len(prefix_prompt):] in all_texts:
+                    if raw_cache:
+                        print(f"[check_if_cache_calculated_before] RAW cache: text=\n{text[len(prefix_prompt):]}\nprefix=\n{prefix_prompt}\n")
+                    else:
+                        print(f"[check_if_cache_calculated_before] PREPROCESS cache: text=\n{text[len(prefix_prompt):]}\nprefix=\n{prefix_prompt}\n")
+                    return True
+        return False
+
+
+
     def save_kv_cache_to_disk(
         self,
         forward_batch,
@@ -2811,14 +2838,24 @@ class DeepseekV2Model(nn.Module):
                             )[forward_batch.out_cache_loc[cache_start_idx+cache_prefix_token_len: cache_end_idx], :, :].to('cpu')
                             kv_cache.append(k_buffer)
                         kv_cache = torch.stack(kv_cache, dim=0)
-                        if not text.startswith(forward_batch.reqs[i].fusionrag_params["prefix_prompt"]):
+                        if not text.startswith(prefix_prompt):
                             print(f"mengyao_debug not start with prefix!\nprefix={forward_batch.reqs[i].fusionrag_params['prefix_prompt']}\ntext={text}")
                         metadata = {
                             "text": text[len(prefix_prompt):], ## only save the document itself.
                             "cache_prefix_token_len": cache_prefix_token_len,
+                            "prefix_text": prefix_prompt
                         }
                         md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
-                        passage_kv_path = f"{self.cache_path}/{md5_hash}"
+                        if forward_batch.reqs[i].fusionrag_params.get("save_preprocess_cache", False) is True:
+                            passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
+                            print(f"mengyao_debug save to PREPROCESS cache\n"
+                                  f"text=\n{text[len(prefix_prompt):]}\n"
+                                  f"prefix=\n{prefix_prompt}")
+                        else:
+                            passage_kv_path = f"{self.cache_path}/{md5_hash}"
+                            print(f"mengyao_debug save to RAW cache\n"
+                                  f"text=\n{text[len(prefix_prompt):]}\n"
+                                  f"prefix=\n{prefix_prompt}")
                         os.makedirs(passage_kv_path, exist_ok=True)
                         metadata_file_path = f"{passage_kv_path}/metadata.json"
                         with open(metadata_file_path, 'w') as f:
@@ -2843,13 +2880,27 @@ class DeepseekV2Model(nn.Module):
         kv_cache = []
         ## starts from the easy case
         if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
-            if forward_batch.forward_mode == ForwardMode.EXTEND and forward_batch.reqs[0].sampling_params.max_new_tokens != 0: ## this is a generation task, and it's in prefill mode
+            if forward_batch.forward_mode == ForwardMode.EXTEND: ## this is a generation task, and it's in prefill mode
                 input_text = copy.deepcopy(forward_batch.reqs[0].origin_input_text)
-                all_chunk_cache = self.list_all_chunk_caches()
+                load_raw_cache = True
+                if (forward_batch.reqs[0].fusionrag_params is not None
+                    and forward_batch.reqs[0].fusionrag_params.get("load_preprocess_cache", False) is True):
+                    ## load from the preprocess cache
+                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=False)
+                    load_raw_cache = False
+                elif (forward_batch.reqs[0].fusionrag_params is not None
+                    and forward_batch.reqs[0].fusionrag_params.get("load_raw_cache", False) is True):
+                    ## load from raw kv cache
+                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=True)
+                else:
+                    return None
                 found_prefix_chunk = True
                 out_cache_loc_start_idx = 0
                 out_cache_loc_end_idx = 0
-                while found_prefix_chunk and len(input_text) > 0:
+                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
+                prefix_prompt_len = len(prefix_prompt)
+                ## 只允许load prefix_prompt_len 长度的prefix
+                while found_prefix_chunk and prefix_prompt_len > 0:
                     found_prefix_chunk = False
                     for cache in all_chunk_cache:
                         chunk_text = cache[0]
@@ -2864,7 +2915,7 @@ class DeepseekV2Model(nn.Module):
                             prev_pos = torch.arange(cache_prefix_token_len, cache_prefix_token_len+load_tensor_len)
                             cur_pos = torch.arange(out_cache_loc_start_idx, out_cache_loc_end_idx)
                             for i, layer in enumerate(self.layers):
-                                k, k_rope = chunk_tensor[i].split([512, 64], dim=-1)
+                                k, k_rope = chunk_tensor[i].split([512, 64], dim=-1) ## fixme.
                                 if forward_batch.reqs[0].fusionrag_params.get("rope", False) is True:
                                     # print(f"doing rope")
                                     k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
@@ -2875,31 +2926,38 @@ class DeepseekV2Model(nn.Module):
                                     k,
                                     k_rope,
                                 )
-
-                            print(f"loaded one text, text={chunk_text}")
+                            if load_raw_cache:
+                                print(f"loaded one RAW cache, text=\n{chunk_text}")
+                            else:
+                                print(f"loaded one PREPROCESS cache, text=\n{chunk_text}")
                             out_cache_loc_start_idx = out_cache_loc_end_idx
                             input_text = input_text[len(chunk_text):]
+                            prefix_prompt_len -= len(chunk_text)
+                            break
+                if forward_batch.reqs[0].sampling_params.max_new_tokens > 0:
+                    print(f"load_kv_cache_to_hbm start computing from {out_cache_loc_end_idx}")
                 if len(input_text) == len(forward_batch.reqs[0].origin_input_text):
                     ## match nothing.
                     return None
-
                 ##fixme: only support one input.
-                if out_cache_loc_end_idx == len(forward_batch.reqs[0].origin_input_ids)-1: ## compute at least one.
+                if out_cache_loc_end_idx == len(forward_batch.reqs[0].origin_input_ids): ## compute at least one.
                     out_cache_loc_end_idx -= 1
                 sorted_indices = torch.arange(out_cache_loc_end_idx, len(forward_batch.reqs[0].origin_input_ids))
                 sorted_indices_plus = random_select_1d(out_cache_loc_end_idx, forward_batch.reqs[0].fusionrag_params.get("rate", 0.0))
                 sorted_indices = torch.cat([sorted_indices_plus, sorted_indices], dim=0)
                 forward_batch.fusion_rag_indices = sorted_indices
                 return sorted_indices
-            else:
-                return None
-        else:
-            return None
+        return None
 
-    def list_all_chunk_caches(self):
+
+    def list_all_chunk_caches(self, raw_cache: bool):
         result = []
-        for folder in os.listdir(self.cache_path):
-            folder_path = os.path.join(self.cache_path, folder)
+        if raw_cache:
+            cache_path = self.cache_path
+        else:
+            cache_path = self.preprocess_cache_path
+        for folder in os.listdir(cache_path):
+            folder_path = os.path.join(cache_path, folder)
             if os.path.isdir(folder_path):
                 metadata_path = os.path.join(folder_path, "metadata.json")
                 if os.path.exists(metadata_path):
