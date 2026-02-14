@@ -357,35 +357,42 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        def print_tensor_diffs_simple(tensor1, tensor2):
-            """
-            简单版本：打印两个张量不同的值和索引
-            """
-            # 检查尺寸是否相同
-            if tensor1.shape != tensor2.shape:
-                print(f"张量尺寸不同！tensor1: {tensor1.shape}, tensor2: {tensor2.shape}")
-                return
+        def print_tensor_diffs_simple(t1, t2):
+            diff_mask = t1 != t2
+            diff_indices = torch.where(diff_mask)
 
-            # 找到不同的元素
-            diff_mask = tensor1 != tensor2
+            # 如果没有差异
+            if len(diff_indices[0]) == 0:
+                print("两个tensor完全相同")
+                return []
 
-            # 如果没有不同的元素
-            if not diff_mask.any():
-                print("两个张量完全相同")
-                return
+            # 打印差异信息
+            print(f"发现 {len(diff_indices[0])} 个差异点:")
+            print("-" * 50)
 
-            # 获取不同元素的索引
-            diff_indices = torch.nonzero(diff_mask)
+            # 获取索引列表
+            indices_list = list(zip(*diff_indices))
 
-            print(f"找到 {len(diff_indices)} 个不同的元素:")
-            print("-" * 30)
+            for i, idx in enumerate(indices_list):
+                # 将索引转换为字符串表示
+                idx_str = "(" + ", ".join(str(i) for i in idx) + ")"
 
-            # 打印每个不同的元素
-            for idx in diff_indices:
-                idx_tuple = tuple(idx.tolist())
-                val1 = tensor1[tuple(idx)].item()
-                val2 = tensor2[tuple(idx)].item()
-                print(f"索引 {idx_tuple}: {val1} vs {val2}")
+                # 获取对应位置的值
+                val1 = t1[idx]
+                val2 = t2[idx]
+
+                # # 打印信息
+
+                # 如果是标量，计算差值
+                if val1.numel() == 1 and val2.numel() == 1:
+                    diff = abs(val1 - val2)
+                    if abs(diff / val1) > 0.1:
+                        print(f"差异点 {i + 1}: 索引 {idx_str}")
+                        print(f"  t1[{idx_str}] = {val1.item() if val1.numel() == 1 else val1}")
+                        print(f"  t2[{idx_str}] = {val2.item() if val2.numel() == 1 else val2}")
+                        print(f"  差值: {diff / val1}")
+
+                        print("-" * 30)
 
         @contextmanager
         def print_options(**kwargs):
@@ -393,19 +400,11 @@ class DeepseekMHAForwardMixin:
         if forward_batch.fusion_rag_indices is not None:
             attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
         else:
+            # q1 = copy.deepcopy(q)
+            # k1 = copy.deepcopy(k)
+            # v1 = copy.deepcopy(v)
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-            q1 = copy.deepcopy(q)
-            k1 = copy.deepcopy(k)
-            v1 = copy.deepcopy(v)
-            attn_output_ = self.forward_normal_core_fusionrag(q1.to(torch.float32), k1.to(torch.float32), v1.to(torch.float32), forward_batch, self.attn_mha.scaling).to(attn_output.dtype)
-            # attn_output__ = self.forward_normal_core_fusionrag_(q2.to(torch.float32), k2.to(torch.float32), v2.to(torch.float32), forward_batch, self.attn_mha.scaling).to(attn_output.dtype)
-            # print(f"mengyao_debug diff1 {torch.nonzero(attn_output != attn_output_)[:100]}")
-            # print(f"mengyao_debug diff2 {torch.nonzero(attn_output != attn_output__)[:100]}")
-            try:
-                if forward_batch.reqs[0].fusionrag_params.get("use_fusion_rag", True):
-                    attn_output = attn_output_
-            except Exception as e:
-                ""
+            # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         # print(f"mengyao_debug forward_normal_core attn_output={attn_output[-1][:5]}")
         output, _ = self.o_proj(attn_output)

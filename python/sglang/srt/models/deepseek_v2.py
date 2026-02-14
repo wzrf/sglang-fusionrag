@@ -2373,11 +2373,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
+        # tp_size = get_tensor_model_parallel_world_size()
         # if forward_batch.forward_mode == ForwardMode.EXTEND:
         #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_attn_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_attn_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     torch.save(hidden_states, save_path)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -2386,9 +2387,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # if forward_batch.forward_mode == ForwardMode.EXTEND:
         #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_prepare_mlp_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_prepare_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_mlp_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     torch.save(hidden_states, save_path)
 
         should_allreduce_fusion = (
@@ -2414,9 +2415,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         # if forward_batch.forward_mode == ForwardMode.EXTEND:
         #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_mlp_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_mlp_hidden_states_{self.layer_id}.pt"
+        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     torch.save(hidden_states, save_path)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
@@ -2621,8 +2622,16 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
+        tp_size_ = get_tensor_model_parallel_world_size()
         self.cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/raw_kv_cache"
         self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
+        print(f"debug = {os.environ.get('DEBUG')}")
+        if os.environ.get("DEBUG", "0") == "1":
+            self.cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/raw_kv_cache"
+            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
+
+        os.makedirs(self.cache_path, exist_ok=True)
+        os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2822,6 +2831,8 @@ class DeepseekV2Model(nn.Module):
         dtype,
         positions,
     ):
+        if get_attention_tp_rank() > 0:
+            return
         if forward_batch.forward_mode == ForwardMode.EXTEND: ## only do this in prefill mode
             if forward_batch.extend_seq_lens_cpu is not None:
                 for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
