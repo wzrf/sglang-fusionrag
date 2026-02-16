@@ -660,6 +660,35 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    async def _find_recompute_token_in_one_request(
+        self,
+        recompute_str_list: List[str],
+        is_cross_encoder_request:bool
+    ):
+        ## the first str doesn't need compute.
+        cur_texts = ""
+        recompute_idx = []
+        for i, recompute_str in enumerate(recompute_str_list):
+            cur_texts_ = copy.deepcopy(cur_texts)
+            cur_texts_ += recompute_str
+            if i %2==1:
+                if cur_texts != "":
+                    prefix_prompt_ids, _ = await self._tokenize_texts(
+                        cur_texts, is_cross_encoder_request
+                    )
+                else:
+                    prefix_prompt_ids = []
+                if cur_texts_ != "":
+                    prefix_prompt_ids_, _ = await self._tokenize_texts(
+                        cur_texts_, is_cross_encoder_request
+                    )
+                else:
+                    prefix_prompt_ids_ = []
+                recompute_idx.extend(range(len(prefix_prompt_ids), len(prefix_prompt_ids_)))
+            cur_texts = cur_texts_
+        return recompute_idx
+
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -702,6 +731,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else:
                     prefix_prompt_ids = []
                 obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
+                if "recompute_tokens" in obj.fusionrag_params:
+                    recompute_idx = await self._find_recompute_token_in_one_request(
+                        recompute_str_list=obj.fusionrag_params["recompute_tokens"],
+                        is_cross_encoder_request=is_cross_encoder_request
+                    )
+                    obj.fusionrag_params["recompute_idx"] = recompute_idx
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):

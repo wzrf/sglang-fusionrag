@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING
 from contextlib import contextmanager
 import torch
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size
+)
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -268,6 +272,10 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe ## fixme q: [seq_len, 128, 192]
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
+        tp_size = get_tensor_model_parallel_world_size()
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
+            torch.save(latent_cache, save_path)
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
@@ -405,9 +413,17 @@ class DeepseekMHAForwardMixin:
             # v1 = copy.deepcopy(v)
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
+        tp_size = get_tensor_model_parallel_world_size()
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/attn_output_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(attn_output, save_path)
+
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         # print(f"mengyao_debug forward_normal_core attn_output={attn_output[-1][:5]}")
         output, _ = self.o_proj(attn_output)
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/o_proj_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
+            torch.save(output, save_path)
         return output
 
     def forward_normal_chunked_kv_prepare(
@@ -663,3 +679,13 @@ class DeepseekMHAForwardMixin:
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
         return k
+
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+import os
+def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
+    if os.environ.get("DEBUG", "0") == "0":
+        return False
+    if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            return True
+    return False

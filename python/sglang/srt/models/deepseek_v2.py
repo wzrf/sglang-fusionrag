@@ -1319,6 +1319,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         llama_4_scaling: Optional[torch.Tensor] = None,
         origin_positions=None,
     ):
+        tp_size = get_tensor_model_parallel_world_size()
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -1327,21 +1328,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_q_{self.layer_id}.pt"
-        #         torch.save(s[3][0], save_path)
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_k_{self.layer_id}.pt"
-        #         torch.save(s[3][1], save_path)
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_forward_v_{self.layer_id}.pt"
-        #         torch.save(s[3][2], save_path)
-        #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_q_{self.layer_id}.pt"
-        #         torch.save(s[3][0], save_path)
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_k_{self.layer_id}.pt"
-        #         torch.save(s[3][1], save_path)
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_forward_v_{self.layer_id}.pt"
-        #         torch.save(s[3][2], save_path)
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_q_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(s[3][0], save_path)
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_k_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(s[3][1], save_path)
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_v_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(s[3][2], save_path)
         return self.forward_core(s)
 
     def forward_prepare(
@@ -2321,7 +2314,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         origin_positions=None
     ) -> torch.Tensor:
 
-
+        tp_rank = get_attention_tp_rank()
         quant_format = (
             "mxfp4"
             if (
@@ -2348,6 +2341,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/init_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(hidden_states, save_path)
         ## mengyao_debug
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -2355,12 +2353,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             quant_format,
         )
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_prepare_attn_hidden_states_{self.layer_id}.pt"
-        #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_attn_hidden_states_{self.layer_id}.pt"
-        #     torch.save(hidden_states, save_path)
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
+            torch.save(hidden_states, save_path)
 
 
         # print(f"mengyao_debug prepare_attn hidden_states={hidden_states[-1][:5]}")
@@ -2373,13 +2368,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
-        # tp_size = get_tensor_model_parallel_world_size()
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     torch.save(hidden_states, save_path)
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/self_attn_hidden_states_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            torch.save(hidden_states, save_path)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2391,6 +2382,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     else:
         #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_prepare_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
         #     torch.save(hidden_states, save_path)
+
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            torch.save(hidden_states, save_path)
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_residual_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            torch.save(residual, save_path)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2413,12 +2410,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/run_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     else:
-        #         save_path = f"/mnt/data3/xmy/fusionrag/debug/cache_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     torch.save(hidden_states, save_path)
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            torch.save(hidden_states, save_path)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2427,6 +2421,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_allreduce_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            torch.save(hidden_states, save_path)
 
         return hidden_states, residual
 
@@ -2831,8 +2828,7 @@ class DeepseekV2Model(nn.Module):
         dtype,
         positions,
     ):
-        if get_attention_tp_rank() > 0:
-            return
+        tp_rank = get_attention_tp_rank()
         if forward_batch.forward_mode == ForwardMode.EXTEND: ## only do this in prefill mode
             if forward_batch.extend_seq_lens_cpu is not None:
                 for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
@@ -2882,7 +2878,7 @@ class DeepseekV2Model(nn.Module):
         dtype,
         positions,
     ) -> torch.Tensor:
-
+        tp_rank = get_attention_tp_rank()
         def random_select_1d(lenth: int, percentage: float):
             num_samples = int(percentage * lenth)
             indices = torch.randperm(lenth)[:num_samples].sort().values
@@ -2909,6 +2905,7 @@ class DeepseekV2Model(nn.Module):
                 out_cache_loc_start_idx = 0
                 out_cache_loc_end_idx = 0
                 prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
+                recompute_idx = forward_batch.reqs[0].fusionrag_params.get("recompute_idx", "")
                 prefix_prompt_len = len(prefix_prompt)
                 ## 只允许load prefix_prompt_len 长度的prefix
                 while found_prefix_chunk and prefix_prompt_len > 0:
@@ -2954,8 +2951,9 @@ class DeepseekV2Model(nn.Module):
                 if out_cache_loc_end_idx == len(forward_batch.reqs[0].origin_input_ids): ## compute at least one.
                     out_cache_loc_end_idx -= 1
                 sorted_indices = torch.arange(out_cache_loc_end_idx, len(forward_batch.reqs[0].origin_input_ids))
-                sorted_indices_plus = random_select_1d(out_cache_loc_end_idx, forward_batch.reqs[0].fusionrag_params.get("rate", 0.0))
-                sorted_indices = torch.cat([sorted_indices_plus, sorted_indices], dim=0)
+                recompute_idx_tensor = torch.tensor(recompute_idx)
+                sorted_indices = torch.cat((sorted_indices, recompute_idx_tensor))
+                sorted_indices = torch.sort(sorted_indices).values
                 forward_batch.fusion_rag_indices = sorted_indices
                 return sorted_indices
         return None
@@ -2968,7 +2966,7 @@ class DeepseekV2Model(nn.Module):
         else:
             cache_path = self.preprocess_cache_path
         for folder in os.listdir(cache_path):
-            folder_path = os.path.join(cache_path, folder)
+            folder_path = os.path.join(cache_path, folder) ## folder is the md5
             if os.path.isdir(folder_path):
                 metadata_path = os.path.join(folder_path, "metadata.json")
                 if os.path.exists(metadata_path):
@@ -3301,9 +3299,10 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
 
 
-def is_fusionrag_load_cache(forward_batch: ForwardBatch) -> bool:
+def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
+    if os.environ.get("DEBUG", "0") == "0":
+        return False
     if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
-        if forward_batch.forward_mode == ForwardMode.EXTEND and forward_batch.reqs[
-            0].sampling_params.max_new_tokens != 0:
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
             return True
     return False
