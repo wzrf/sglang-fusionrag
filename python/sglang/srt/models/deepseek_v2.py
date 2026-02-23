@@ -2620,13 +2620,17 @@ class DeepseekV2Model(nn.Module):
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
         tp_size_ = get_tensor_model_parallel_world_size()
-        self.cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/raw_kv_cache"
-        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
+        cache_path_root = "/mnt/data3"
+        if not os.path.exists(cache_path_root):
+            cache_path_root = "/mnt/data"
+        self.cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2/raw_kv_cache"
+        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
         print(f"debug = {os.environ.get('DEBUG')}")
         if os.environ.get("DEBUG", "0") == "1":
-            self.cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/raw_kv_cache"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
 
+        print(f"cache_path = {self.cache_path}")
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -2905,7 +2909,7 @@ class DeepseekV2Model(nn.Module):
                 out_cache_loc_start_idx = 0
                 out_cache_loc_end_idx = 0
                 prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
-                recompute_idx = forward_batch.reqs[0].fusionrag_params.get("recompute_idx", "")
+                recompute_idx = forward_batch.reqs[0].fusionrag_params.get("recompute_idx", [])
                 prefix_prompt_len = len(prefix_prompt)
                 ## 只允许load prefix_prompt_len 长度的prefix
                 while found_prefix_chunk and prefix_prompt_len > 0:
@@ -2922,10 +2926,10 @@ class DeepseekV2Model(nn.Module):
                             load_tensor_len = chunk_tensor.shape[1]
                             prev_pos = torch.arange(cache_prefix_token_len, cache_prefix_token_len+load_tensor_len)
                             cur_pos = torch.arange(out_cache_loc_start_idx, out_cache_loc_end_idx)
+                            print(f"doing rope from {prev_pos} to {cur_pos}")
                             for i, layer in enumerate(self.layers):
                                 k, k_rope = chunk_tensor[i].split([512, 64], dim=-1) ## fixme.
                                 if forward_batch.reqs[0].fusionrag_params.get("rope", False) is True:
-                                    # print(f"doing rope")
                                     k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
                                                           wrong_positions=prev_pos, correct_positions=cur_pos)
                                 forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -2951,10 +2955,12 @@ class DeepseekV2Model(nn.Module):
                 if out_cache_loc_end_idx == len(forward_batch.reqs[0].origin_input_ids): ## compute at least one.
                     out_cache_loc_end_idx -= 1
                 sorted_indices = torch.arange(out_cache_loc_end_idx, len(forward_batch.reqs[0].origin_input_ids))
-                recompute_idx_tensor = torch.tensor(recompute_idx)
-                sorted_indices = torch.cat((sorted_indices, recompute_idx_tensor))
-                sorted_indices = torch.sort(sorted_indices).values
+                if len(recompute_idx) > 0:
+                    recompute_idx_tensor = torch.tensor(recompute_idx)
+                    sorted_indices = torch.cat((sorted_indices, recompute_idx_tensor))
+                    sorted_indices = torch.sort(sorted_indices).values
                 forward_batch.fusion_rag_indices = sorted_indices
+                print(f"recompute_idx = {forward_batch.fusion_rag_indices}")
                 return sorted_indices
         return None
 

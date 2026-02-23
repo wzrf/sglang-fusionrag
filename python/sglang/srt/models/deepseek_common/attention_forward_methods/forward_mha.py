@@ -406,7 +406,10 @@ class DeepseekMHAForwardMixin:
         def print_options(**kwargs):
             torch.set_printoptions(**kwargs)
         if forward_batch.fusion_rag_indices is not None:
-            attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
+            # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
+            attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling).to(q.dtype)
+            if self.layer_id == 10:
+                print(f"using fusion_rag_indices to compute, q_shape={q.shape}, k_shape={k.shape}, v_shape={v.shape}")
         else:
             # q1 = copy.deepcopy(q)
             # k1 = copy.deepcopy(k)
