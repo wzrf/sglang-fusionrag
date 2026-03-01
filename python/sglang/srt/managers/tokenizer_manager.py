@@ -32,6 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -723,20 +724,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids = await self._tokenize_texts(
                 input_text, is_cross_encoder_request
             )
-            if obj.fusionrag_params is not None and "prefix_prompt" in obj.fusionrag_params:
-                if len(obj.fusionrag_params["prefix_prompt"]) > 0:
-                    prefix_prompt_ids, _ = await self._tokenize_texts(
-                        obj.fusionrag_params["prefix_prompt"], is_cross_encoder_request
-                    )
-                else:
-                    prefix_prompt_ids = []
-                obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
+            if obj.fusionrag_params is not None:
+                if "prefix_prompt" in obj.fusionrag_params:
+                    if len(obj.fusionrag_params["prefix_prompt"]) > 0:
+                        prefix_prompt_ids, _ = await self._tokenize_texts(
+                            obj.fusionrag_params["prefix_prompt"], is_cross_encoder_request
+                        )
+                    else:
+                        prefix_prompt_ids = []
+                    obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
+
                 if "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(
                         recompute_str_list=obj.fusionrag_params["recompute_tokens"],
                         is_cross_encoder_request=is_cross_encoder_request
                     )
                     obj.fusionrag_params["recompute_idx"] = recompute_idx
+
+                obj.fusionrag_params["recompute_idx"] = torch.tensor([1, 10, 100, len(input_ids)-1])
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):

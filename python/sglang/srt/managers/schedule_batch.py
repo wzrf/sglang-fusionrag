@@ -564,6 +564,7 @@ class Req:
             self.kv_gen_prefix_input_text = ""
             self.save_preprocess_cache = False
             self.save_raw_cache = False
+            self.recompute_idx = None
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids

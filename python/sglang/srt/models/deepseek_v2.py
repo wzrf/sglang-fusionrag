@@ -2712,15 +2712,25 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         self.fix_rope_test(forward_batch)
-        new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
-                                  dtype=hidden_states.dtype,
-                                  device=hidden_states.device,
-                                    positions=positions)
+        recompute_idx = self.find_recompute_idx(forward_batch)
         origin_positions = None
-        if new_positions is not None:
+        if recompute_idx is not None:
             origin_positions = copy.deepcopy(positions)
-            positions = new_positions.to(positions.device)
+            positions = recompute_idx.to(positions.device)
             hidden_states = hidden_states[positions]
+        forward_batch.fusion_rag_indices = recompute_idx
+
+        # new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
+        #                           dtype=hidden_states.dtype,
+        #                           device=hidden_states.device,
+        #                             positions=positions)
+        # origin_positions = None
+        # if new_positions is not None:
+        #     origin_positions = copy.deepcopy(positions)
+        #     positions = new_positions.to(positions.device)
+        #     hidden_states = hidden_states[positions]
+
+
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2903,7 +2913,7 @@ class DeepseekV2Model(nn.Module):
     ):
         if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                forward_batch.reqs
+                return forward_batch.reqs[0].recompute_idx
 
 
     def load_kv_cache_to_hbm(

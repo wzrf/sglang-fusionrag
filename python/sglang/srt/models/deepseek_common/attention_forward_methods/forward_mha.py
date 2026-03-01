@@ -249,7 +249,8 @@ class DeepseekMHAForwardMixin:
             if forward_batch.fusion_rag_indices is None:
                 kv_a = self.kv_a_layernorm(kv_a)
             else:
-                kv_a[forward_batch.fusion_rag_indices] = self.kv_a_layernorm(kv_a[forward_batch.fusion_rag_indices]) ## otherwise only do this.
+                ## otherwise only do norm on fusion_rag_indices kvs.
+                kv_a[forward_batch.fusion_rag_indices] = self.kv_a_layernorm(kv_a[forward_batch.fusion_rag_indices])
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :] ## fixme k_pe: [seq_len, 1, 64]
         if self.rotary_emb is not None:
