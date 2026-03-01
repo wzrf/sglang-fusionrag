@@ -547,6 +547,24 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        self.use_chunk_node: bool = True
+        self.hit_chunk_nodes: Any = None
+        self.hit_chunk_values: Any = None
+        if fusionrag_params is not None:
+            self.is_kv_gen = fusionrag_params.get("save_cache", False)
+            self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
+            self.kv_gen_prefix_input_text = fusionrag_params.get("prefix_prompt", "")
+            self.save_preprocess_cache = fusionrag_params.get("preprocess", False)
+            self.recompute_idx = fusionrag_params.get("recompute_idx", None)
+            self.save_raw_cache = not self.save_preprocess_cache
+            fusionrag_params = None
+        else:
+            self.is_kv_gen = False
+            self.kv_gen_prefix_len = 0
+            self.kv_gen_prefix_input_text = ""
+            self.save_preprocess_cache = False
+            self.save_raw_cache = False
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -872,26 +890,32 @@ class Req:
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
-                    # key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key, origin_input_text=self.origin_input_text),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            self.cache_protected_len = len(self.prefix_indices)
+            if self.use_chunk_node:
+                self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
+                self.host_hit_length = match_result.host_hit_length
+                # self.prefix_indices = match_result.device_indices
+                self.prefix_indices = torch.tensor([]) ## mengyao_debug let it be empty, we will read it later.
+            else:
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                    self.mamba_branching_seqlen,
+                ) = (
+                    match_result.device_indices,
+                    match_result.last_device_node,
+                    match_result.last_host_node,
+                    match_result.host_hit_length,
+                    match_result.mamba_branching_seqlen,
+                )
+                self.cache_protected_len = len(self.prefix_indices)
 
         if (
             self.is_retracted

@@ -661,8 +661,10 @@ class Scheduler(
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+                from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
 
-                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                # self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                self.tree_cache = FusionragCache(params=params, server_args=server_args)
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )

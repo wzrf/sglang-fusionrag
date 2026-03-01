@@ -721,13 +721,23 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
-                )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                if not req.use_chunk_node:
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        req.last_host_node, req.host_hit_length
+                    )
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                    prefix_len = len(req.prefix_indices)
+                    req.cache_protected_len = prefix_len
+                else:
+                    new_indices, values_list = self.tree_cache.init_load_back_chunk(
+                        req.hit_chunk_nodes
+                    )
+                    req.prefix_indices = new_indices
+                    req.hit_chunk_values = values_list
+                    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                    prefix_len = len(req.prefix_indices)
+                    req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

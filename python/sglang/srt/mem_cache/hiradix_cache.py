@@ -441,6 +441,7 @@ class HiRadixCache(RadixCache):
         delta = self.inc_lock_ref(ancester_node)
 
         # load it all or not at all
+        ##mengyao_debug 释放不出足够的空间来
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if len(host_indices) < self.load_back_threshold or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
@@ -688,6 +689,7 @@ class HiRadixCache(RadixCache):
             return
         operation.mark_terminate()
 
+    ## fixme: mengyao_debug 需要修改
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -725,6 +727,7 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+    ## fixme: 需要修改
     def prefetch_from_storage(
         self,
         req_id: str,

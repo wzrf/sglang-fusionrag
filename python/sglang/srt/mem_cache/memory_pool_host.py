@@ -228,6 +228,13 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def set_from_length(self, index: int, length:int, data_page: torch.Tensor) -> None:
+        """
+        Set a flat data page to the host memory pool.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         """
         Set a flat data page to the host memory pool.
@@ -247,9 +254,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        # assert (
+        #     need_size % self.page_size == 0
+        # ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
@@ -939,6 +946,24 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         ).flatten()
+
+    def set_from_length(self, index: int, length: int, data_page: torch.Tensor) -> None:
+        if self.layout == "layer_first":
+            self.kv_buffer[:, index : index + length, :, :] = data_page.reshape(
+                self.layer_num,
+                length,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        elif self.layout == "page_first":
+            self.kv_buffer[index : index + length, :, :, :] = data_page.reshape(
+                length,
+                self.layer_num,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         if self.layout == "layer_first":

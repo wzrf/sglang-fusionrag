@@ -64,6 +64,7 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    all_hit_chunk_nodes: Any = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -135,6 +136,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def pretty_print(self):
+        raise NotImplementedError()
+
+    def init_load_back_chunk(
+        self,
+        all_hit_nodes: Any
+    ) -> Tuple[torch.Tensor, Any]:
+        """
+        Preparing KV cache loading from host to device.
+        """
         raise NotImplementedError()
 
     def init_load_back(

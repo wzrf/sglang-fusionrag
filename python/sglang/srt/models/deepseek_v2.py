@@ -2532,7 +2532,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        # config.num_hidden_layers = 5
+        config.num_hidden_layers = 5
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -2711,6 +2711,7 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
+        self.fix_rope_test(forward_batch)
         new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
                                   dtype=hidden_states.dtype,
                                   device=hidden_states.device,
@@ -2875,6 +2876,36 @@ class DeepseekV2Model(nn.Module):
 
         ""
 
+    def fix_rope_test(
+        self,
+        forward_batch
+    ):
+        for req in forward_batch.reqs:
+            if req.hit_chunk_values is not None:
+                for layer_id in range(len(self.layers)):
+                    for indices in req.hit_chunk_values:
+                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[indices, :, :]
+                        k = k_buffer[:,:,:512]
+                        k_rope = k_buffer[:,:,512:]
+                        layer = self.layers[layer_id]
+                        k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
+                                                       wrong_positions=torch.arange(0, len(indices)), correct_positions=indices)
+                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                            layer.self_attn.attn_mha,
+                            indices,
+                            k,
+                            k_rope,
+                        )
+
+    def find_recompute_idx(
+        self,
+        forward_batch
+    ):
+        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                forward_batch.reqs
+
+
     def load_kv_cache_to_hbm(
         self,
         forward_batch,
@@ -2961,6 +2992,7 @@ class DeepseekV2Model(nn.Module):
                     sorted_indices = torch.sort(sorted_indices).values
                 forward_batch.fusion_rag_indices = sorted_indices
                 print(f"recompute_idx = {forward_batch.fusion_rag_indices}")
+                print(f"recompute percentage = {len(recompute_idx)/out_cache_loc_end_idx}")
                 return sorted_indices
         return None
 

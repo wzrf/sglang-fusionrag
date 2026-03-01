@@ -65,6 +65,7 @@ class RadixKey:
         token_ids: List[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
+        origin_input_text: Optional[str] = None,
     ):
         # token ids sequence
         self.token_ids = token_ids
@@ -72,6 +73,7 @@ class RadixKey:
         self.extra_key = extra_key
         # is bigram key
         self.is_bigram = is_bigram
+        self.origin_input_text = origin_input_text
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -454,7 +456,7 @@ class RadixCache(BasePrefixCache):
         keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle, origin_input_text=req.origin_input_text)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:

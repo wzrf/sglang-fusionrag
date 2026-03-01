@@ -226,20 +226,9 @@ class DeepseekMHAForwardMixin:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) ## fixme q_pe: [seq_len, 128, 64]
-        ## latent cache is wrong here.
-        if forward_batch.fusion_rag_indices is not None: ## we are doing fusion rag
-            # we load from kv cache rather than using the generate KV
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
-                latent_cache.dtype
-            )[forward_batch.out_cache_loc, :, :].to(latent_cache.device)
-            latent_cache = latent_cache.unsqueeze(1)
-            k_buffer[positions] = latent_cache ## positions should be the same as forward_batch.fusion_rag_indices
-            latent_cache = k_buffer
-            kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            kv_a = kv_a.squeeze(1).contiguous()
-        else:
-            kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) ## fixme kv_a: [seq_len, 512]
-            latent_cache = latent_cache.unsqueeze(1) ## fixme latent_cache: [seq_len, 1, 576]
+
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) ## fixme kv_a: [seq_len, 512]
+        latent_cache = latent_cache.unsqueeze(1) ## fixme latent_cache: [seq_len, 1, 576]
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
@@ -271,25 +260,38 @@ class DeepseekMHAForwardMixin:
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe ## fixme q: [seq_len, 128, 192]
 
+        ##todo: 需要修改存储地址
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):
             save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
             torch.save(latent_cache, save_path)
+        ##todo 上面的代码好想和这里冲突了
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+            if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
+                # we load from kv cache rather than using the generate KV
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
+                    latent_cache.dtype
+                )[forward_batch.out_cache_loc, :, :].to(latent_cache.device)
+                latent_cache = latent_cache.unsqueeze(1)
+                k_buffer[positions] = latent_cache  ## positions should be the same as forward_batch.fusion_rag_indices
+                latent_cache = k_buffer
+                kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                kv_a = kv_a.squeeze(1).contiguous()
             else:
-                # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
+                if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+                    # FP8 path: dequantize NSA-specific FP8 format to BF16
+                    kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+                else:
+                    # BF16/FP16 path: directly fetch from cache
+                    kv_a, k_pe = self._get_mla_kv_buffer(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        q.dtype,
+                        forward_batch,
+                    )
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
             kv = self.kv_b_proj(
                 kv_a_quanted,
