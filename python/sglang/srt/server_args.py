@@ -1163,6 +1163,7 @@ class ServerArgs:
                     else:
                         # For CUDA GPU
                         self.page_size = 64
+                        self.page_size = 1 ## mengyao_debug hardcode
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently

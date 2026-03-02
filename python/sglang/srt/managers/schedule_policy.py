@@ -733,7 +733,8 @@ class PrefillAdder:
                     new_indices, values_list = self.tree_cache.init_load_back_chunk(
                         req.hit_chunk_nodes
                     )
-                    req.prefix_indices = new_indices
+                    # req.prefix_indices = new_indices ## disable this.
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                     req.hit_chunk_values = values_list
                     req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                     prefix_len = len(req.prefix_indices)

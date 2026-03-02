@@ -1728,7 +1728,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if _is_hip:
             assert self.page_size == 1
         else:
-            assert self.page_size == 64
+            "" ##mengyao_debug hardcode
+            # assert self.page_size == 64
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool

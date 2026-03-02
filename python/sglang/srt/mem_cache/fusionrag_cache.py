@@ -44,6 +44,17 @@ from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
+class HitCacheNode:
+    def __init__(
+        self,
+        value: torch.Tensor,
+        original_position: torch.Tensor,
+        current_position: torch.Tensor,
+    ):
+        self.original_position: torch.Tensor = original_position
+        self.current_position: torch.Tensor = current_position
+        self.value: torch.Tensor = value
+
 class ChunkNode:
 
     counter = 0
@@ -456,6 +467,7 @@ class FusionragCache(RadixCache):
 
     ##fixme: evict的数据不需要存储到host，会污染kvcache
     def evict(self, num_tokens: int):
+        print(f"we need to evict {num_tokens} tokens")
         raise f"panic! not enough memories!"
         ""
 
@@ -494,8 +506,16 @@ class FusionragCache(RadixCache):
         offset = 0
         all_values = []
         for node in nodes_to_load:
-            node.values.append(device_indices[offset : offset + len(node.host_value)])
-            all_values.append(node.values[-1])
+            device_hit_index = device_indices[offset : offset + len(node.host_value)]
+            node.values.append(device_hit_index)
+            all_values.append(
+                HitCacheNode(
+                    value=device_hit_index,
+                    current_position=torch.arange(offset, offset + len(node.host_value)).to(device_hit_index.device),
+                    original_position=torch.arange(node.cache_prefix_token_len,
+                                                   node.cache_prefix_token_len + len(node.host_value)).to(device_hit_index.device),
+                )
+            )
             offset += len(node.host_value)
 
         if self.metrics_collector is not None:
@@ -504,7 +524,8 @@ class FusionragCache(RadixCache):
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
-        return device_indices[:-1], all_values ## left one just for decode
+        # return device_indices[:-1], all_values ## left one just for decode
+        return device_indices, all_values  ## mengyao_debug hardcode
 
     def init_load_back_chunk(
         self,
@@ -532,7 +553,11 @@ class FusionragCache(RadixCache):
                     last_round_found = True
 
         return MatchResult(
-            device_indices=torch.tensor([]), ## mengyao_debug let all be empty on the device.
+            device_indices=torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                ), ## mengyao_debug let all be empty on the device.
             all_hit_chunk_nodes=all_hit_chunk_nodes,
             host_hit_length=host_hit_length,
             last_host_node=None,
@@ -625,9 +650,11 @@ class FusionragCache(RadixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        ##todo 这里有问题，prefix_len 设置成了0，所以只把alloc_extend申请的内存free掉了，但是prefix的内存没有free掉。
+        ##todo 还是把prefix_len改成对的吧
         self.cache_controller.mem_pool_device_allocator.free(kv_indices)
         for i, node in enumerate(req.hit_chunk_nodes):
-            node.values.remove(req.hit_chunk_values[i])
+            node.values.remove(req.hit_chunk_values[i].value)
 
     def _write_cache_to_disk(self, req: Req, kv_indices: torch.Tensor) -> None:
         kv_cache = []

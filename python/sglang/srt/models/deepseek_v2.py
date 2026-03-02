@@ -2712,19 +2712,20 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         self.fix_rope_test(forward_batch)
-        recompute_idx = self.find_recompute_idx(forward_batch)
+
         origin_positions = None
-        if recompute_idx is not None:
-            origin_positions = copy.deepcopy(positions)
-            positions = recompute_idx.to(positions.device)
-            hidden_states = hidden_states[positions]
-        forward_batch.fusion_rag_indices = recompute_idx
+
+        # recompute_idx = self.find_recompute_idx(forward_batch)
+        # if recompute_idx is not None:
+        #     origin_positions = copy.deepcopy(positions)
+        #     positions = recompute_idx.to(positions.device)
+        #     hidden_states = hidden_states[positions]
+        #     forward_batch.fusion_rag_indices = positions
 
         # new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
         #                           dtype=hidden_states.dtype,
         #                           device=hidden_states.device,
         #                             positions=positions)
-        # origin_positions = None
         # if new_positions is not None:
         #     origin_positions = copy.deepcopy(positions)
         #     positions = new_positions.to(positions.device)
@@ -2893,16 +2894,19 @@ class DeepseekV2Model(nn.Module):
         for req in forward_batch.reqs:
             if req.hit_chunk_values is not None:
                 for layer_id in range(len(self.layers)):
-                    for indices in req.hit_chunk_values:
-                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[indices, :, :]
+                    for hit_chunk_node in req.hit_chunk_values:
+                        device_indices = hit_chunk_node.value
+                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[device_indices, :, :]
                         k = k_buffer[:,:,:512]
                         k_rope = k_buffer[:,:,512:]
                         layer = self.layers[layer_id]
-                        k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
-                                                       wrong_positions=torch.arange(0, len(indices)), correct_positions=indices)
+                        k_rope = correct_rope_rotation(k_rope,
+                                                       layer.self_attn.rotary_emb.cos_sin_cache,
+                                                       wrong_positions=hit_chunk_node.original_position,
+                                                       correct_positions=hit_chunk_node.current_position)
                         forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                             layer.self_attn.attn_mha,
-                            indices,
+                            device_indices,
                             k,
                             k_rope,
                         )
@@ -3348,6 +3352,7 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 
 
 def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
+    return False
     if os.environ.get("DEBUG", "0") == "0":
         return False
     if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task

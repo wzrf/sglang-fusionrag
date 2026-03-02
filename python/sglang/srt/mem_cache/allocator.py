@@ -306,7 +306,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: KVCache,
         need_sort: bool,
     ):
-        page_size = 1
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
