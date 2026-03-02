@@ -550,12 +550,13 @@ class Req:
         self.use_chunk_node: bool = True ##mengyao_debug hardcode
         self.hit_chunk_nodes: Any = None
         self.hit_chunk_values: Any = None
+        self.recompute_idx: List[int] = []
         if fusionrag_params is not None:
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             self.kv_gen_prefix_input_text = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("preprocess", False)
-            self.recompute_idx = fusionrag_params.get("recompute_idx", torch.tensor([], dtype=torch.int64))
+            self.recompute_idx = fusionrag_params.get("recompute_idx", [])
             self.save_raw_cache = not self.save_preprocess_cache
             fusionrag_params = None
         else:
@@ -564,7 +565,7 @@ class Req:
             self.kv_gen_prefix_input_text = ""
             self.save_preprocess_cache = False
             self.save_raw_cache = False
-            self.recompute_idx = torch.tensor([], dtype=torch.int64)
+            self.recompute_idx = []
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1506,13 +1507,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        # input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = []
+        for r in reqs:
+            input_id = r.fill_ids[len(r.prefix_indices) :]
+            if len(r.recompute_idx) >0:
+                input_id_recompute = [r.fill_ids[i] for i in r.recompute_idx]
+                input_id_recompute.extend(input_id)
+                input_id = input_id_recompute
+            input_ids.append(input_id)
+
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
-        recompute_indices = [r.recompute_idx for r in reqs]
 
 
         # For matryoshka embeddings

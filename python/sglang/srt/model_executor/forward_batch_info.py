@@ -1107,14 +1107,14 @@ def compute_position_torch_recompute_indices(
     recompute_indices: list[torch.Tensor],
 ):
     seq_list = []
-    for prefix_len, extend_len, recompute_index in zip(extend_prefix_lens, extend_seq_lens, recompute_indices):
+    for prefix_len, extend_len, recompute_idx in zip(extend_prefix_lens, extend_seq_lens, recompute_indices):
         seq = torch.arange(
             prefix_len,
             prefix_len + extend_len,
             device=extend_prefix_lens.device
         )
-        recompute_index = recompute_index.to(seq.device)
-        seq = torch.cat([recompute_index, seq], dim=0)
+        recompute_idx = torch.tensor(recompute_idx, dtype=torch.int64).to(seq.device)
+        seq = torch.cat([recompute_idx, seq], dim=0)
         seq = torch.unique(seq) ## mengyao_debug hardcode
         seq_list.append(seq)
 
