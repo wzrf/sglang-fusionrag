@@ -86,7 +86,8 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
                 sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
                 and not attn.disable_chunked_prefix_cache
             )
-            or sum_extend_prefix_lens == 0
+            # or sum_extend_prefix_lens == 0 ## mengyao_debug hardcode
+            or sum_extend_prefix_lens < 1e10
         )
     ):
         if _support_mha_one_shot(attn, forward_batch, backend_name):

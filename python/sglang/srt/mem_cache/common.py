@@ -328,6 +328,8 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    recompute_cache_indices: list[torch.Tensor],
+    input_ids_only_extend: list[list[int]]
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -358,7 +360,13 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        # out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        out_cache_loc = torch.tensor([]).to(batch.device)
+        for i, req in enumerate(batch.reqs):
+            recompute_cache_index = recompute_cache_indices[i]
+            out_cache_loc_extend = alloc_token_slots(batch.tree_cache, len(input_ids_only_extend[i]))
+            out_cache_loc = torch.cat([out_cache_loc, recompute_cache_index, out_cache_loc_extend]).to(torch.int64)
+
     else:
         # Paged allocation - build last_loc
         last_loc = [

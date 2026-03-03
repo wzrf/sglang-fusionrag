@@ -1509,15 +1509,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         # input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         input_ids = []
+        input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
+        recompute_cache_indices = []
         for r in reqs:
             input_id = r.fill_ids[len(r.prefix_indices) :]
-            if len(r.recompute_idx) >0:
+            if len(r.recompute_idx) > 0:
                 input_id_recompute = [r.fill_ids[i] for i in r.recompute_idx]
                 input_id_recompute.extend(input_id)
                 input_id = input_id_recompute
             input_ids.append(input_id)
+            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
 
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        extend_num_tokens = sum(len(ids) for ids in input_ids_only_extend)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -1563,7 +1566,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
+            self, recompute_cache_indices, input_ids_only_extend
         )
 
         # Set fields

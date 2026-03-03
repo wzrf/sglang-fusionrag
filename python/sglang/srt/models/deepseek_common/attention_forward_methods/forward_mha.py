@@ -269,22 +269,23 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
+                kv_indices = forward_batch.fetch_mha_one_shot_kv_indices(),
                 kv_a, k_pe = self._get_mla_kv_buffer(
                     forward_batch.fetch_mha_one_shot_kv_indices(),
                     q.dtype,
                     forward_batch,
                 )
-        if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
-            # we load from kv cache rather than using the generate KV
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
-                latent_cache.dtype
-            )[forward_batch.out_cache_loc, :, :].to(latent_cache.device)
-            k_buffer[positions] = latent_cache  ## positions should be the same as forward_batch.fusion_rag_indices
-            latent_cache = k_buffer
-            kv_a, k_pe_cache = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_pe_cache[positions] = k_pe
-            k_pe = k_pe_cache
-            kv_a = kv_a.squeeze(1).contiguous()
+        # if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
+        #     # we load from kv cache rather than using the generate KV
+        #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
+        #         latent_cache.dtype
+        #     )[forward_batch.out_cache_loc, :, :].to(latent_cache.device)
+        #     k_buffer[positions] = latent_cache  ## positions should be the same as forward_batch.fusion_rag_indices
+        #     latent_cache = k_buffer
+        #     kv_a, k_pe_cache = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        #     k_pe_cache[positions] = k_pe
+        #     k_pe = k_pe_cache
+        #     kv_a = kv_a.squeeze(1).contiguous()
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
             kv = self.kv_b_proj(
@@ -567,18 +568,10 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
-            if forward_batch.fusion_rag_indices is None:
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-                )
-            else:
-                loc = forward_batch.out_cache_loc[forward_batch.fusion_rag_indices]
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    self.attn_mha,
-                    loc,
-                    kv_a.unsqueeze(1),
-                    k_pe
-                )
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+
         elif _is_npu:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(

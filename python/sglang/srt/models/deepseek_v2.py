@@ -2714,6 +2714,10 @@ class DeepseekV2Model(nn.Module):
         self.fix_rope_test(forward_batch)
 
         origin_positions = None
+        if forward_batch.forward_mode == ForwardMode.EXTEND and\
+            len(forward_batch.reqs) == 1 and forward_batch.reqs[0].hit_chunk_nodes is not None \
+            and len(forward_batch.reqs[0].hit_chunk_nodes) > 0:
+            forward_batch.fusion_rag_indices = positions
 
         # recompute_idx = self.find_recompute_idx(forward_batch)
         # if recompute_idx is not None:
@@ -2805,10 +2809,6 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        if forward_batch.fusion_rag_indices is not None:
-            hidden_states_full = torch.zeros(hidden_states_origin_shape, dtype=hidden_states.dtype).to(hidden_states.device)
-            hidden_states_full[forward_batch.fusion_rag_indices] = hidden_states
-            hidden_states = hidden_states_full
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
