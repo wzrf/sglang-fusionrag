@@ -402,7 +402,7 @@ class DeepseekMHAForwardMixin:
         @contextmanager
         def print_options(**kwargs):
             torch.set_printoptions(**kwargs)
-        if forward_batch.fusion_rag_indices is not None:
+        if False and forward_batch.fusion_rag_indices is not None:
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
             attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.attn_mha.scaling).to(q.dtype)
             if self.layer_id == 10:

@@ -166,9 +166,10 @@ def handle_attention_triton(attn, forward_batch):
 
     if (
         forward_batch.forward_mode.is_extend_without_speculative()
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+        # and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
-        return AttnForwardMethod.MHA
+        # return AttnForwardMethod.MHA
+        return AttnForwardMethod.MHA_ONE_SHOT
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
 

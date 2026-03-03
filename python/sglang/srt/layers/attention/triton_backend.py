@@ -50,6 +50,7 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
     window_kv_offsets: torch.Tensor
+    full_indptr: torch.Tensor
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -147,6 +148,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.kv_indptr = kv_indptr_buf
+        self.full_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+        )
 
         # If sliding window is enabled, we might need two sets of buffers
         # because of interleaved attention types (e.g. for Gemma3)
@@ -231,6 +235,7 @@ class TritonAttnBackend(AttentionBackend):
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
+        full_indptr = self.full_indptr
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
@@ -373,11 +378,52 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
+            full_indptr[1 : bs + 1] = torch.cumsum(
+                forward_batch.orig_seq_lens, dim=0
+            )
+            kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 sum(forward_batch.extend_prefix_lens_cpu),
                 dtype=torch.int64,
                 device=self.device,
             )
+            ## let's build the custom_mask
+            ## todo@mengyao_debug 这种情况完全不考虑prefix match。
+            batch_size = len(forward_batch.reqs)
+            custom_mask_size = []
+            custom_q_len = []
+            custom_kv_len = []
+            for req in forward_batch.reqs:
+                if len(req.recompute_idx) == 0:
+                    custom_mask_size.append(req.seqlen * req.seqlen)
+                    custom_q_len.append(req.seqlen)
+                    custom_kv_len.append(req.seqlen)
+                else:
+                    custom_mask_size.append(len(req.recompute_idx) * req.seqlen)
+                    custom_q_len.append(len(req.recompute_idx))
+                    custom_kv_len.append(req.seqlen)
+            custom_mask = torch.ones(
+                len(custom_mask_size), dtype=torch.bool, device=self.device
+            )
+            mask_indptr = torch.zeros((batch_size + 1,), dtype=torch.int64, device=self.device)
+            mask_indptr[1: batch_size + 1] = sum(custom_mask_size[:batch_size])
+
+            for i in range(batch_size):
+                if custom_q_len[i] == custom_kv_len[i]:
+                    causal_mask_ = (
+                        torch.tril(
+                            torch.ones(custom_q_len[i], custom_q_len[i]), diagonal=0
+                        )
+                        == 1
+                    )
+                else:
+                    recompute_idx = forward_batch.reqs[i].recompute_idx
+                    causal_mask_ = torch.zeros(custom_q_len[i], custom_kv_len[i], dtype=torch.bool).to(self.device)
+                    for j, q_idx in enumerate(recompute_idx):
+                        causal_mask_[j, q_idx + 1:] = True  # True表示要mask掉的位置
+
+                custom_mask[mask_indptr[i]: mask_indptr[i + 1]] = causal_mask_
+
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
@@ -403,7 +449,8 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_recompute_len, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None
@@ -426,6 +473,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            full_indptr
         )
 
     def init_cuda_graph_state(
@@ -649,6 +697,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            self.full_indptr ## just to run @mengyao
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -835,6 +884,8 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        ##
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -855,6 +906,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            full_indptr=self.forward_metadata.full_indptr,
         )
         return o
 

@@ -560,6 +560,7 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    full_indptr=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
