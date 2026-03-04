@@ -551,6 +551,8 @@ class Req:
         self.hit_chunk_nodes: Any = None
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
+        ## ## all the index needs to compute, including the recompute index and the postfix.
+        self.all_compute_idx: List[int] = []
         if fusionrag_params is not None:
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
@@ -1517,6 +1519,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 input_id_recompute = [r.fill_ids[i] for i in r.recompute_idx]
                 input_id_recompute.extend(input_id)
                 input_id = input_id_recompute
+            recompute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
+            r.all_compute_idx = copy.deepcopy(r.recompute_idx)
+            r.all_compute_idx.extend(recompute_idx)
             input_ids.append(input_id)
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
 

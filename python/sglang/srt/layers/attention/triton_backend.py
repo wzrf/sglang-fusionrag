@@ -177,6 +177,7 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+        self.global_run_idx = 0
 
     def get_num_kv_splits(
         self,
@@ -1342,13 +1343,13 @@ def make_custom_casual_mask(forward_batch: ForwardBatch):
     custom_q_len = []
     custom_kv_len = []
     for req in forward_batch.reqs:
-        if len(req.recompute_idx) == 0:
+        if len(req.all_compute_idx) == 0:
             custom_mask_size.append(req.seqlen * req.seqlen)
             custom_q_len.append(req.seqlen)
             custom_kv_len.append(req.seqlen)
         else:
-            custom_mask_size.append(len(req.recompute_idx) * req.seqlen)
-            custom_q_len.append(len(req.recompute_idx))
+            custom_mask_size.append(len(req.all_compute_idx) * req.seqlen)
+            custom_q_len.append(len(req.all_compute_idx))
             custom_kv_len.append(req.seqlen)
     custom_mask = torch.ones(
         sum(custom_mask_size), dtype=torch.bool, device='cuda'
@@ -1368,9 +1369,9 @@ def make_custom_casual_mask(forward_batch: ForwardBatch):
                     == 1
             )
         else:
-            recompute_idx = forward_batch.reqs[i].recompute_idx
+            all_compute_idx = forward_batch.reqs[i].all_compute_idx
             causal_mask_ = torch.ones(custom_q_len[i], custom_kv_len[i], dtype=torch.bool).to('cuda')
-            for j, q_idx in enumerate(recompute_idx):
+            for j, q_idx in enumerate(all_compute_idx):
                 causal_mask_[j, q_idx + 1:] = False  # False表示要mask掉的位置
         causal_mask_ = causal_mask_.flatten()
 
