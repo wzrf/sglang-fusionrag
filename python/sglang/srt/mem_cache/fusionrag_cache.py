@@ -656,6 +656,8 @@ class FusionragCache(RadixCache):
         for i, node in enumerate(req.hit_chunk_nodes):
             node.values.remove(req.hit_chunk_values[i].value)
 
+        self.req_to_token_pool.free(req.req_pool_idx)
+
     def _write_cache_to_disk(self, req: Req, kv_indices: torch.Tensor) -> None:
         kv_cache = []
         for layer_id in range(self.kv_cache.layer_num):
