@@ -389,40 +389,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             ## let's build the custom_mask
             ## todo@mengyao_debug 这种情况完全不考虑prefix match。
-            batch_size = len(forward_batch.reqs)
-            custom_mask_size = []
-            custom_q_len = []
-            custom_kv_len = []
-            for req in forward_batch.reqs:
-                if len(req.recompute_idx) == 0:
-                    custom_mask_size.append(req.seqlen * req.seqlen)
-                    custom_q_len.append(req.seqlen)
-                    custom_kv_len.append(req.seqlen)
-                else:
-                    custom_mask_size.append(len(req.recompute_idx) * req.seqlen)
-                    custom_q_len.append(len(req.recompute_idx))
-                    custom_kv_len.append(req.seqlen)
-            custom_mask = torch.ones(
-                len(custom_mask_size), dtype=torch.bool, device=self.device
-            )
-            mask_indptr = torch.zeros((batch_size + 1,), dtype=torch.int64, device=self.device)
-            mask_indptr[1: batch_size + 1] = sum(custom_mask_size[:batch_size])
-
-            for i in range(batch_size):
-                if custom_q_len[i] == custom_kv_len[i]:
-                    causal_mask_ = (
-                        torch.tril(
-                            torch.ones(custom_q_len[i], custom_q_len[i]), diagonal=0
-                        )
-                        == 1
-                    )
-                else:
-                    recompute_idx = forward_batch.reqs[i].recompute_idx
-                    causal_mask_ = torch.zeros(custom_q_len[i], custom_kv_len[i], dtype=torch.bool).to(self.device)
-                    for j, q_idx in enumerate(recompute_idx):
-                        causal_mask_[j, q_idx + 1:] = True  # True表示要mask掉的位置
-
-                custom_mask[mask_indptr[i]: mask_indptr[i + 1]] = causal_mask_
+            mask_indptr, custom_mask = make_custom_casual_mask(forward_batch)
 
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -452,8 +419,8 @@ class TritonAttnBackend(AttentionBackend):
             # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_recompute_len, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
-            mask_indptr = None
+            # custom_mask = None
+            # mask_indptr = None
             attn_logits = None
             attn_lse = None
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
@@ -1367,3 +1334,46 @@ def update_sliding_window_buffer_cuda_graph(
             )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
+
+
+def make_custom_casual_mask(forward_batch: ForwardBatch):
+    batch_size = len(forward_batch.reqs)
+    custom_mask_size = []
+    custom_q_len = []
+    custom_kv_len = []
+    for req in forward_batch.reqs:
+        if len(req.recompute_idx) == 0:
+            custom_mask_size.append(req.seqlen * req.seqlen)
+            custom_q_len.append(req.seqlen)
+            custom_kv_len.append(req.seqlen)
+        else:
+            custom_mask_size.append(len(req.recompute_idx) * req.seqlen)
+            custom_q_len.append(len(req.recompute_idx))
+            custom_kv_len.append(req.seqlen)
+    custom_mask = torch.ones(
+        sum(custom_mask_size), dtype=torch.bool, device='cuda'
+    )
+    mask_indptr = torch.zeros((batch_size + 1,), dtype=torch.int64, device='cuda')
+
+    for batch_idx in range(batch_size):
+        mask_indptr[batch_idx+1] = sum(custom_mask_size[:batch_idx+1])
+
+    print(mask_indptr)
+    for i in range(batch_size):
+        if custom_q_len[i] == custom_kv_len[i]:
+            causal_mask_ = (
+                    torch.tril(
+                        torch.ones(custom_q_len[i], custom_q_len[i]), diagonal=0
+                    )
+                    == 1
+            )
+        else:
+            recompute_idx = forward_batch.reqs[i].recompute_idx
+            causal_mask_ = torch.ones(custom_q_len[i], custom_kv_len[i], dtype=torch.bool).to('cuda')
+            for j, q_idx in enumerate(recompute_idx):
+                causal_mask_[j, q_idx + 1:] = False  # False表示要mask掉的位置
+        causal_mask_ = causal_mask_.flatten()
+
+        custom_mask[mask_indptr[i]: mask_indptr[i + 1]] = causal_mask_
+
+    return mask_indptr, custom_mask

@@ -207,6 +207,214 @@ def build_unified_kv_indices(
 
     return unified_kv_indptr, unified_kv_indices, prefix_lens
 
+@triton.jit
+def _fwd_kernel_fusionrag(
+    Q_Extend,
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    K_Buffer,
+    V_Buffer,
+    qo_indptr,
+    kv_indptr,
+    full_indptr,
+    kv_indices,
+    mask_ptr,
+    mask_indptr,
+    sink_ptr,
+    window_kv_offset_ptr,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
+    logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+):
+    cur_seq = tl.program_id(0)  ##fixme: 0
+    cur_head = tl.program_id(1)  ##fixme: 0->128
+    cur_block_m = tl.program_id(2)  ##fixme: 0
+    cur_kv_head = cur_head // kv_group_num
+    # tl.device_print("cur_block_m", cur_block_m)
+
+    cur_seq_q_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_q_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_q_extend_start_idx
+    cur_seq_k_extend_start_idx = tl.load(full_indptr + cur_seq)
+    cur_seq_k_len_extend = tl.load(full_indptr + cur_seq + 1) - cur_seq_k_extend_start_idx
+    # cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    # cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    # cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+
+    cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)  ##fixme: 128,BLOCK_DMODEL 每个head有多少维度？
+    offs_dv = tl.arange(0, BLOCK_DV)  ##fixme: 128,BLOCK_DV=value维度是多少
+    offs_m = tl.arange(0, BLOCK_M)
+    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_q_len_extend ##fixme: mask_m 代表这一行要不要算
+
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
+    offs_q = (
+            (cur_seq_q_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+            * stride_qbs  ## stride_qbs = 128*192
+            + cur_head * stride_qh  ## stride_qh = 192
+            + offs_d[None, :]
+    )
+
+    q = tl.load(
+        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+    )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_q_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+            * stride_qbs
+            + cur_head * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)  ##fixme: 64*128
+    deno = tl.zeros([BLOCK_M], dtype=tl.float32)  ##fixme: 64
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    # stage 2: compute the triangle part
+    ##mengyao_debug: 需要计算完整序列
+    cur_block_m_end = cur_seq_k_len_extend
+
+    for start_n in range(0, cur_block_m_end, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < cur_seq_k_len_extend ## fixme:
+
+        final_mask = mask_m[:, None] & mask_n[None, :]
+
+        custom_mask = tl.load(
+            mask_ptr
+            + cur_seq_mask_start_idx
+            + (cur_block_m * BLOCK_M + offs_m[:, None])
+            * (cur_seq_k_len_extend)
+            + start_n
+            + offs_n[None, :],
+            mask=(mask_m[:, None] & mask_n[None, :]),
+            other=0,
+        )
+        # if cur_seq == 1 and cur_head == 0:
+        #     tl.device_print("custom_mask", custom_mask)
+
+        custom_mask &= mask_m[:, None] & mask_n[None, :]
+        final_mask &= custom_mask
+
+        ## k的加载方式需要修改，需要把这一整条给load出来
+        offs_k = (
+                (cur_seq_k_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs  ##fixme: offs_n: 0->64
+                + cur_kv_head * stride_kh
+                + offs_d[:, None]  ##fixme: offs_d: 0->128
+        )
+        # if cur_seq == 1 and cur_head == 0:
+        #     tl.device_print("offs_k", offs_k)
+
+        ##fixme offs_k: [128, 64]
+        k = tl.load(
+            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
+        # if cur_head == 0:
+            # tl.device_print("offs_k", offs_k)  ##fixme: [128, 64]
+            # tl.device_print("k", k)
+        qk = tl.dot(q, k, out_dtype=tl.float32)  ##fixme: 64*128 @ 128*64
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                    (cur_seq_k_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs  ##fixme: offs_n: 0->64
+                    + cur_kv_head * stride_kh
+                    + offs_dpe[:, None]  ##fixme: offs_dpe: 128->192
+            )
+            ## fixme: offs_dpe: [64, 64]
+            kpe = tl.load(
+                K_Extend + offs_kpe,
+                mask=mask_n[None, :],
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe)
+        qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        # if xai_temperature_len > 0:
+        #     qk *= xai_temperature_reg[:, None]
+
+        qk = tl.where(final_mask, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        deno = deno * re_scale + tl.sum(p, 1)
+
+        ##todo: mengyao_debug: v的形状要和k一样
+        offs_v = (
+                (cur_seq_k_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                + cur_kv_head * stride_vh
+                + offs_dv[None, :]
+        )  ##fixme: offs_v=[64,128]
+
+        v = tl.load(
+            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
+        p = p.to(v.dtype)
+        acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+        e_max = n_e_max
+
+    if HAS_SINK:
+        cur_sink = tl.load(sink_ptr + cur_head)
+        deno += tl.exp(cur_sink - e_max)
+
+    offs_o = (
+        (cur_seq_q_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+        * stride_obs
+        + cur_head * stride_oh
+        + offs_dv[None, :]
+    )
+    if STORE_TRANSPOSE:
+        tl.store(
+            O_Extend + offs_o.T,
+            (acc / deno[:, None]).T,
+            mask=(mask_m[:, None] & mask_dv[None, :]).T,
+        )
+    else:
+        tl.store(
+            O_Extend + offs_o,
+            acc / deno[:, None],
+            mask=mask_m[:, None] & mask_dv[None, :],
+        )
 
 @triton.jit
 def _fwd_kernel(
@@ -595,7 +803,7 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _fwd_kernel[grid](
+    _fwd_kernel_fusionrag[grid](
         q_extend,
         k_extend,
         v_extend,
@@ -604,6 +812,7 @@ def extend_attention_fwd(
         v_buffer,
         qo_indptr,
         kv_indptr,
+        full_indptr,
         kv_indices,
         custom_mask,
         mask_indptr,
