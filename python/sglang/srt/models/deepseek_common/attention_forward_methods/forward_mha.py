@@ -139,6 +139,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         origin_positions: torch.Tensor,
+        RUN_IDX: int=0,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -257,7 +258,7 @@ class DeepseekMHAForwardMixin:
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(latent_cache, save_path)
         ##todo: this will never happen on fusion rag case.
         if (
@@ -489,10 +490,11 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         origin_positions: torch.Tensor,
+        RUN_IDX: int=0
     ):
         forward_batch.mha_one_shot = True
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator, origin_positions
+            positions, hidden_states, forward_batch, zero_allocator, origin_positions, RUN_IDX
         )
 
     def forward_normal_one_shot_core(
@@ -678,6 +680,7 @@ class DeepseekMHAForwardMixin:
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 import os
 def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
+    return False
     if os.environ.get("DEBUG", "0") == "0":
         return False
     if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task

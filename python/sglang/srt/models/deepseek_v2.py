@@ -207,6 +207,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
 ]
 
+RUN_IDX = 0
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -571,6 +572,7 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
+                    forward_batch
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -614,6 +616,7 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -633,6 +636,14 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+
+        global RUN_IDX
+        if is_extend_and_debug(forward_batch):
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/router_logits_{self.layer_id}_tp_{0}_runidx_{RUN_IDX}.pt"
+            torch.save(router_logits, save_path)
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/topk_output_{self.layer_id}_tp_{0}_runidx_{RUN_IDX}.pt"
+            torch.save(topk_output.topk_weights, save_path)
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -1328,12 +1339,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             llama_4_scaling=llama_4_scaling,
             origin_positions=origin_positions,
         )
+        global RUN_IDX
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_q_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_q_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
             torch.save(s[3][0], save_path)
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_k_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_k_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
             torch.save(s[3][1], save_path)
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_v_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/forward_prepare_v_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
             torch.save(s[3][2], save_path)
         return self.forward_core(s)
 
@@ -1369,6 +1381,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
 
+        global RUN_IDX
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1380,7 +1393,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
-                positions, hidden_states, forward_batch, zero_allocator, origin_positions
+                positions, hidden_states, forward_batch, zero_allocator, origin_positions, RUN_IDX
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
@@ -2341,10 +2354,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
-
+        global RUN_IDX
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/init_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/init_hidden_states_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
         ## mengyao_debug
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -2354,7 +2367,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format,
         )
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_attn_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_attn_hidden_states_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
 
 
@@ -2369,7 +2382,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             origin_positions=origin_positions,
         )
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/self_attn_hidden_states_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/self_attn_hidden_states_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -2384,9 +2397,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     torch.save(hidden_states, save_path)
 
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_residual_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/prepare_mlp_residual_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(residual, save_path)
 
         should_allreduce_fusion = (
@@ -2411,7 +2424,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
@@ -2422,7 +2435,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_allreduce_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}.pt"
+            save_path = f"/mnt/data3/xmy/fusionrag/debug/hidden_states_allreduce_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(hidden_states, save_path)
 
         return hidden_states, residual
@@ -2645,6 +2658,8 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        global RUN_IDX
+        RUN_IDX += 1
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -3354,7 +3369,7 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
     return False
     if os.environ.get("DEBUG", "0") == "0":
-        return False
+        return True
     if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             return True

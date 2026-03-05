@@ -742,8 +742,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["recompute_idx"] = recompute_idx
 
                 ##mengyao_debug hardcode
-                if obj.fusionrag_params.get("recompute_debug", False) == True:
-                    obj.fusionrag_params["recompute_idx"] = [0]
+                elif obj.fusionrag_params.get("recompute_debug", False) == True:
+                    import random
+                    length = len(input_ids) - 1
+                    if length > 0:
+                        recompute_length = int(len(input_ids) * 0.3)
+                        numbers = random.sample(range(length), recompute_length)
+                        numbers.sort()
+                        obj.fusionrag_params["recompute_idx"] = numbers
+                    else:
+                        obj.fusionrag_params["recompute_idx"] = [0]
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
