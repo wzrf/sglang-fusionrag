@@ -1078,7 +1078,7 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            batch, no_run_list = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             # Launch the current batch
@@ -1088,6 +1088,8 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+
+            self.process_batch_result_no_run(no_run_list)
 
             # Update last_batch
             self.last_batch = batch
@@ -1789,7 +1791,7 @@ class Scheduler(
         else:
             self.req_to_token_pool.free(req.req_pool_idx)
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(self) -> Tuple[Optional[ScheduleBatch], List[Req]]:
         self._abort_on_queued_timeout()
         if self.dllm_config is not None:
             self.dllm_staging_reqs.filter_finished_reqs()
@@ -1839,7 +1841,7 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        new_batch, no_run_list = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1871,7 +1873,7 @@ class Scheduler(
         if ret:
             trace_event_batch("schedule", ret.reqs)
 
-        return ret
+        return ret, no_run_list
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
@@ -1879,7 +1881,7 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(self) -> Tuple[Optional[ScheduleBatch], List[Req]]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             _, token_usage, _, _ = self._get_token_info()
@@ -1887,18 +1889,18 @@ class Scheduler(
                 self.prefill_delayer, token_usage=token_usage
             )
 
-        ret = self._get_new_batch_prefill_raw(
+        ret, no_run_list = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass
         )
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
-        return ret
+        return ret, no_run_list
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
-    ) -> Optional[ScheduleBatch]:
+    ) -> Tuple[Optional[ScheduleBatch], List[Req]]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1912,7 +1914,7 @@ class Scheduler(
         if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
             not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
         ):
-            return None
+            return None, []
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
@@ -1926,7 +1928,7 @@ class Scheduler(
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
-            return None
+            return None, []
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
@@ -1938,7 +1940,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None
+            return None, []
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -2046,8 +2048,12 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        no_run_list: List[Req] = adder.no_run_list
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(no_run_list)
+        ]
         if len(can_run_list) == 0:
-            return None
+            return None, no_run_list
 
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
@@ -2137,7 +2143,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
-        return new_batch
+        return new_batch, no_run_list
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

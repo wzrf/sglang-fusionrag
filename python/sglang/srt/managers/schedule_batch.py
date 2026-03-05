@@ -709,6 +709,7 @@ class Req:
         self.temp_input_top_logprobs_idx: Optional[List[int]] = None
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
+        self.no_need_to_run = False
 
         if return_logprob:
             # shape: (bs, 1)
@@ -800,7 +801,10 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
-        self.fusionrag_params=fusionrag_params
+        if fusionrag_params is not None:
+            self.fusionrag_params=fusionrag_params
+        else:
+            self.fusionrag_params = {}
 
     @property
     def seqlen(self) -> int:
@@ -903,7 +907,11 @@ class Req:
             if self.use_chunk_node:
                 self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
                 self.host_hit_length = match_result.host_hit_length
-                self.prefix_indices = match_result.device_indices
+                self.prefix_indices = match_result.device_indices ## empty
+                if self.is_kv_gen is True:
+                    if self.host_hit_length == len(self.origin_input_ids):
+                        self.no_need_to_run = True
+
                 # self.prefix_indices = torch.tensor([]) ## mengyao_debug let it be empty, we will read it later.
             else:
                 (
@@ -1514,16 +1522,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         recompute_cache_indices = []
         for r in reqs:
-            input_id = r.fill_ids[len(r.prefix_indices) :]
-            if len(r.recompute_idx) > 0:
-                input_id_recompute = [r.fill_ids[i] for i in r.recompute_idx]
-                input_id_recompute.extend(input_id)
-                input_id = input_id_recompute
-            recompute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
-            r.all_compute_idx = copy.deepcopy(r.recompute_idx)
-            r.all_compute_idx.extend(recompute_idx)
-            input_ids.append(input_id)
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
+            r.all_compute_idx = copy.deepcopy(r.recompute_idx)
+            extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
+            r.all_compute_idx.extend(extend_compute_idx)
+            ## mengyao_debug: just in case it overlaps
+            r.all_compute_idx = sorted(set(r.all_compute_idx))
+            input_id = [r.fill_ids[i] for i in r.all_compute_idx]
+            input_ids.append(input_id)
 
         extend_num_tokens = sum(len(ids) for ids in input_ids_only_extend)
         seq_lens = [len(r.fill_ids) for r in reqs]

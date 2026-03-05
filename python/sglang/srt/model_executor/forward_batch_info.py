@@ -495,7 +495,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
-            recompute_indices = [r.recompute_idx for r in batch.reqs]
+            all_compute_indices = [r.all_compute_idx for r in batch.reqs]
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -504,11 +504,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc, ret.extend_recompute_len = compute_position_with_recompute_indices( ##mengyao_debug hardcode
-                model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
-                ret.extend_num_tokens,
-                recompute_indices
+                all_compute_indices
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1018,16 +1016,23 @@ def compute_position(
     return positions, extend_start_loc
 
 def compute_position_with_recompute_indices(
-    attn_backend: str,
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
-    extend_seq_lens_sum: int,
-    recompute_indices: list[torch.Tensor],
+    all_compute_indices: list[list[int]],
 ):
-    positions, extend_start_loc, seq_list_compute_len = compute_position_torch_recompute_indices(
-        extend_prefix_lens, extend_seq_lens, recompute_indices
-    )
-    return positions, extend_start_loc, seq_list_compute_len
+    seq_list = []
+    seq_list_compute_len = []
+    for prefix_len, all_compute_idx in zip(extend_prefix_lens, all_compute_indices):
+        all_compute_idx = torch.tensor(all_compute_idx, dtype=torch.int64).to(extend_prefix_lens.device)
+        seq_list.append(all_compute_idx)
+        seq_list_compute_len.append(len(all_compute_idx))
+
+    positions = torch.cat(seq_list, dim=0)
+    seq_list_compute_len = torch.tensor(seq_list_compute_len).to(extend_prefix_lens.device).to(torch.int64)
+
+    extend_start_loc = torch.zeros_like(extend_seq_lens)
+    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+    return positions.to(torch.int64), extend_start_loc, seq_list_compute_len
 
 
 def compute_position_triton(
@@ -1101,32 +1106,6 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
-
-def compute_position_torch_recompute_indices(
-    extend_prefix_lens: torch.Tensor,
-    extend_seq_lens: torch.Tensor,
-    recompute_indices: list[torch.Tensor],
-):
-    seq_list = []
-    seq_list_compute_len = []
-    for prefix_len, extend_len, recompute_idx in zip(extend_prefix_lens, extend_seq_lens, recompute_indices):
-        seq = torch.arange(
-            prefix_len,
-            prefix_len + extend_len,
-            device=extend_prefix_lens.device
-        )
-        recompute_idx = torch.tensor(recompute_idx, dtype=torch.int64).to(seq.device)
-        seq = torch.cat([recompute_idx, seq], dim=0)
-        seq = torch.unique(seq) ## mengyao_debug hardcode
-        seq_list.append(seq)
-        seq_list_compute_len.append(len(seq))
-
-    positions = torch.cat(seq_list, dim=0)
-    seq_list_compute_len = torch.tensor(seq_list_compute_len).to(extend_prefix_lens.device).to(torch.int64)
-
-    extend_start_loc = torch.zeros_like(extend_seq_lens)
-    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc, seq_list_compute_len
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)

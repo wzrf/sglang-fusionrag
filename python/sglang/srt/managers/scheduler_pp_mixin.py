@@ -223,7 +223,7 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk()
-                batch = self.get_new_batch_prefill()
+                batch, _ = self.get_new_batch_prefill() ##fixme: mengyaodebug
                 batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch

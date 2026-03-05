@@ -631,6 +631,9 @@ class FusionragCache(RadixCache):
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+        ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
+        if req.no_need_to_run:
+            return
         if req.is_kv_gen:
             ##todo：检查本地是否存在
             token_ids = req.origin_input_ids

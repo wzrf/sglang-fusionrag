@@ -83,7 +83,7 @@ class SchedulerMultiplexMixin:
             return False
 
         # add new request
-        batch = self.get_new_batch_prefill()
+        batch, _ = self.get_new_batch_prefill() ##fixme: mengyaodebug
         if batch and not batch.is_empty():
             batch.forward_mode = (
                 ForwardMode.SPLIT_PREFILL

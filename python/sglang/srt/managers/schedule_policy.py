@@ -398,6 +398,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        self.no_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -709,6 +710,10 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        if req.no_need_to_run:
+            self.no_run_list.append(req)
+            return self.budget_state()
+
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -734,8 +739,8 @@ class PrefillAdder:
                         req.hit_chunk_nodes
                     )
                     req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                    if len(req.prefix_indices) == len(req.fill_ids):
-                        req.prefix_indices = new_indices[:-1] ##mengyao_debug hardcode left one for prefill
+                    if len(req.prefix_indices) >= len(req.fill_ids):
+                        req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
                     req.hit_chunk_values = values_list
                     req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                     prefix_len = len(req.prefix_indices)

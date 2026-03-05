@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_LENGTH,
     Req,
     RequestStage,
     ScheduleBatch,
@@ -81,6 +82,17 @@ class SchedulerOutputProcessorMixin:
                 if k not in req.customized_info:
                     req.customized_info[k] = []
                 req.customized_info[k].append(v[i])
+
+    def process_batch_result_no_run(
+        self: Scheduler,
+        reqs: List[Req]
+    ):
+        # for req in reqs:
+        #     release_kv_cache(req, self.tree_cache)
+        for req in reqs:
+            req.finished_reason = FINISH_LENGTH(length=0)
+        self.stream_output(reqs, False)
+
 
     def process_batch_result_prefill(
         self: Scheduler,
