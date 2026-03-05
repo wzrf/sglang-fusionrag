@@ -275,6 +275,8 @@ class DeepseekMHAForwardMixin:
                     q.dtype,
                     forward_batch,
                 )
+                print(f"mengyao_debug kv_indices = {kv_indices}")
+                print(f"mengyao_debug kv_a = {kv_a[0]}")
         # if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
         #     # we load from kv cache rather than using the generate KV
         #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
@@ -676,7 +678,6 @@ class DeepseekMHAForwardMixin:
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 import os
 def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
-    return False
     if os.environ.get("DEBUG", "0") == "0":
         return False
     if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task

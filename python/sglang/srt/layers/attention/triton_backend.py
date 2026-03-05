@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -876,6 +877,23 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             full_indptr=self.forward_metadata.full_indptr,
         )
+        if os.environ.get("DEBUG", "0") == "1":
+            layer_id = layer.layer_id
+            if layer_id == 0:
+                self.global_run_idx += 1
+            path = "/mnt/data3/xmy/tests/tmp_save"
+            torch.save(
+                q, f"{path}/q_runid_{self.global_run_idx}_layer_{layer_id}.pt"
+            )
+            torch.save(
+                k, f"{path}/k_runid_{self.global_run_idx}_layer_{layer_id}.pt"
+            )
+            torch.save(
+                v, f"{path}/v_runid_{self.global_run_idx}_layer_{layer_id}.pt"
+            )
+            torch.save(
+                o, f"{path}/o_runid_{self.global_run_idx}_layer_{layer_id}.pt"
+            )
         return o
 
     def _forward_extend_unified(

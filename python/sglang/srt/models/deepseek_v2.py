@@ -2767,11 +2767,11 @@ class DeepseekV2Model(nn.Module):
                 # print(f"mengyao_debug hidden_states shape={hidden_states.shape}")
                 # print(f"mengyao_debug hidden_states {hidden_states[-1][:5]}")
 
-        self.save_kv_cache_to_disk(
-            forward_batch,
-            dtype=hidden_states.dtype,
-            positions=positions
-        )
+        # self.save_kv_cache_to_disk(
+        #     forward_batch,
+        #     dtype=hidden_states.dtype,
+        #     positions=positions
+        # )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

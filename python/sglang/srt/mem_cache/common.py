@@ -88,7 +88,8 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    ## mengyao_debug just for easy debug
+    if False and support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -362,10 +363,26 @@ def alloc_for_extend(
     if batch.tree_cache.page_size == 1:
         # out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
         out_cache_loc = torch.tensor([]).to(batch.device)
+        out_cache_loc_extends = torch.tensor([]).to(batch.device)
         for i, req in enumerate(batch.reqs):
             recompute_cache_index = recompute_cache_indices[i]
             out_cache_loc_extend = alloc_token_slots(batch.tree_cache, len(input_ids_only_extend[i]))
             out_cache_loc = torch.cat([out_cache_loc, recompute_cache_index, out_cache_loc_extend]).to(torch.int64)
+            out_cache_loc_extends = torch.cat([out_cache_loc_extends, out_cache_loc_extend]).to(torch.int64)
+
+        write_cache_indices(
+            out_cache_loc_extends,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
 
     else:
         # Paged allocation - build last_loc
@@ -383,20 +400,20 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
 
-    # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
+        # Write to req_to_token_pool
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
