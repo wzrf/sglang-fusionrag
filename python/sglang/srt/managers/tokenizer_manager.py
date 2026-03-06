@@ -740,7 +740,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 input_text, is_cross_encoder_request
             )
             if obj.fusionrag_params is not None:
+                prefix_prompt_ids = []
+                prefix_prompt = ""
                 if "prefix_prompt" in obj.fusionrag_params:
+                    prefix_prompt = obj.fusionrag_params["prefix_prompt"]
                     if len(obj.fusionrag_params["prefix_prompt"]) > 0:
                         prefix_prompt_ids, _ = await self._tokenize_texts(
                             obj.fusionrag_params["prefix_prompt"], is_cross_encoder_request

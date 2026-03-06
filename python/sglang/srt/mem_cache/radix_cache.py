@@ -66,6 +66,8 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
         origin_input_text: Optional[str] = None,
+        prefix_prompt_text: Optional[str] = None,
+        is_kv_gen: bool = False,
     ):
         # token ids sequence
         self.token_ids = token_ids
@@ -74,7 +76,8 @@ class RadixKey:
         # is bigram key
         self.is_bigram = is_bigram
         self.origin_input_text = origin_input_text
-
+        self.prefix_prompt_text = prefix_prompt_text
+        self.is_kv_gen = is_kv_gen
     def __len__(self) -> int:
         return len(self.token_ids)
 

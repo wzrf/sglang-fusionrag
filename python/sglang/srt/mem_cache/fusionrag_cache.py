@@ -230,6 +230,9 @@ class FusionragCache(RadixCache):
             cache_path_root = "/mnt/data"
         self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/raw_kv_cache"
         self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/preprocess_kv_cache"
+        if os.environ.get("DEBUG", "0") == "1":
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/raw_kv_cache"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -540,8 +543,15 @@ class FusionragCache(RadixCache):
     def match_prefix(self, params: MatchPrefixParams):
         all_hit_chunk_nodes = []
         host_hit_length = 0
-        input_text = str(copy.deepcopy(params.key.origin_input_text))
+        if params.key.is_kv_gen:
+            # if it's to gen kv, we check if the origin_input_text has already been generated.
+            input_text = str(copy.deepcopy(params.key.origin_input_text))
+        else:
+            # if it's a decoding task, we match prefix in prefix_prompt_text
+            input_text = str(copy.deepcopy(params.key.prefix_prompt_text))
         last_round_found = True
+        if len(input_text) == 0:
+            print(f"mengyao_debug fusionrag cache match_prefix skipping prefix.")
         while len(input_text) > 0 and last_round_found:
             last_round_found = False
             for node in self.all_nodes:
@@ -668,13 +678,14 @@ class FusionragCache(RadixCache):
             kv_cache.append(k_buffer)
         kv_cache = torch.stack(kv_cache, dim=0)
         text = req.origin_input_text
-        prefix_prompt = req.kv_gen_prefix_input_text
+        prefix_prompt = req.prefix_prompt
         cache_prefix_token_len = req.kv_gen_prefix_len
         metadata = {
             "text": text[len(prefix_prompt):],  ## only save the document itself.
             "cache_prefix_token_len": cache_prefix_token_len,
             "prefix_text": prefix_prompt
         }
+        ## 同步执行环境，不存在锁的问题
         md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
         if req.save_preprocess_cache is True:
             passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
@@ -684,7 +695,7 @@ class FusionragCache(RadixCache):
         elif req.save_raw_cache is True:
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
             print(f"mengyao_debug save to RAW cache\n"
-                  f"text=\n{text[len(prefix_prompt):]}\n"
+                  f"text=\n{text[len(prefix_prompt):][:20]}\n"
                   f"prefix=\n{prefix_prompt}")
         else:
             raise "either save_preprocess_cache or save_raw_cache must be True"

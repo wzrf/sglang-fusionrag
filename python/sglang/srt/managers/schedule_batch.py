@@ -556,7 +556,7 @@ class Req:
         if fusionrag_params is not None:
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
-            self.kv_gen_prefix_input_text = fusionrag_params.get("prefix_prompt", "")
+            self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("preprocess", False)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
             self.save_raw_cache = not self.save_preprocess_cache
@@ -564,7 +564,7 @@ class Req:
         else:
             self.is_kv_gen = False
             self.kv_gen_prefix_len = 0
-            self.kv_gen_prefix_input_text = ""
+            self.prefix_prompt = ""
             self.save_preprocess_cache = False
             self.save_raw_cache = False
             self.recompute_idx = []
@@ -899,7 +899,11 @@ class Req:
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
-                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key, origin_input_text=self.origin_input_text),
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text,
+                                 prefix_prompt_text=self.prefix_prompt,
+                                 is_kv_gen=self.is_kv_gen),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
@@ -910,6 +914,7 @@ class Req:
                 self.prefix_indices = match_result.device_indices ## empty
                 if self.is_kv_gen is True:
                     if self.host_hit_length == len(self.origin_input_ids):
+                        print(f"req doesn't need to be run.")
                         self.no_need_to_run = True
 
                 # self.prefix_indices = torch.tensor([]) ## mengyao_debug let it be empty, we will read it later.
@@ -1528,6 +1533,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.all_compute_idx.extend(extend_compute_idx)
             ## mengyao_debug: just in case it overlaps
             r.all_compute_idx = sorted(set(r.all_compute_idx))
+            if r.is_kv_gen:
+                print(f"mengyao_debug This is a KV GEN TASK")
+            else:
+                print(f"mengyao_debug This is a DECODER TASK")
+            if len(r.prefix_indices) >0:
+                print(f"mengyao_debug recompute percentage="
+                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%")
+            else:
+                print(f"mengyao_debug compute percentage=100%")
             # print(f"r.all_compute_idx = {r.all_compute_idx}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
