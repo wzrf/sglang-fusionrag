@@ -546,7 +546,7 @@ class FusionragCache(RadixCache):
             last_round_found = False
             for node in self.all_nodes:
                 if input_text.startswith(node.text):
-                    print(f"load text: {node.text}")
+                    print(f"load text: {node.text[:20]}")
                     host_hit_length += len(node.host_value)
                     all_hit_chunk_nodes.append(node)
                     input_text = input_text[len(node.text) :]

@@ -419,7 +419,7 @@ class TritonAttnBackend(AttentionBackend):
 
             qo_indptr = self.qo_indptr
             # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_recompute_len, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_all_compute_len, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             # custom_mask = None
             # mask_indptr = None
@@ -894,6 +894,7 @@ class TritonAttnBackend(AttentionBackend):
         #     torch.save(
         #         o, f"{path}/o_runid_{self.global_run_idx}_layer_{layer_id}.pt"
         #     )
+        # print(f"layer_id={layer.layer_id}. o={o[-1]}")
         return o
 
     def _forward_extend_unified(

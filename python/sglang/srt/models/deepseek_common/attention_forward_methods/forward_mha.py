@@ -276,8 +276,8 @@ class DeepseekMHAForwardMixin:
                     q.dtype,
                     forward_batch,
                 )
-                print(f"mengyao_debug kv_indices = {kv_indices}")
-                print(f"mengyao_debug kv_a = {kv_a[0]}")
+                # print(f"mengyao_debug kv_indices = {kv_indices}")
+                # print(f"mengyao_debug kv_a = {kv_a[0]}")
         # if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
         #     # we load from kv cache rather than using the generate KV
         #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(

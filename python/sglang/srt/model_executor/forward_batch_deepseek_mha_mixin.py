@@ -182,7 +182,7 @@ class ForwardBatchDeepSeekMHAMixin:
             device=self.req_pool_indices.device,
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
-        print(f"req_to_token = {self.req_to_token_pool.req_to_token[self.req_pool_indices[0]][:400]}")
+        # print(f"req_to_token = {self.req_to_token_pool.req_to_token[self.req_pool_indices[0]][:400]}")
         create_flashinfer_kv_indices_triton[(self.batch_size,)](
             self.req_to_token_pool.req_to_token,
             self.req_pool_indices,

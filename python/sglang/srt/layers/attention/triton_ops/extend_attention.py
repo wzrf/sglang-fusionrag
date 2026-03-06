@@ -797,6 +797,8 @@ def extend_attention_fwd(
     HAS_SINK = sinks is not None
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    grid = (batch_size, head_num, triton.cdiv(q_extend.shape[0], BLOCK_M))
+    print(f"mengyao_debug q_shape = {q_extend.shape}\n grid = {grid}")
     num_stages = 1
 
     extra_kargs = {}

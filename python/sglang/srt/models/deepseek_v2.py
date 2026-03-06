@@ -2545,7 +2545,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        config.num_hidden_layers = 5
+        # config.num_hidden_layers = 5
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -2906,6 +2906,8 @@ class DeepseekV2Model(nn.Module):
         self,
         forward_batch
     ):
+        if forward_batch is None or forward_batch.reqs is None:
+            return
         for req in forward_batch.reqs:
             if req.hit_chunk_values is not None:
                 for layer_id in range(len(self.layers)):
@@ -3256,6 +3258,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            # print(f"mengyao_debug hidden_states={hidden_states[-1]}")
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )

@@ -1528,6 +1528,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.all_compute_idx.extend(extend_compute_idx)
             ## mengyao_debug: just in case it overlaps
             r.all_compute_idx = sorted(set(r.all_compute_idx))
+            # print(f"r.all_compute_idx = {r.all_compute_idx}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
 

@@ -116,6 +116,7 @@ class LogitsMetadata:
     extend_token_ids_logprob: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
+    extend_all_compute_lens: Optional[torch.Tensor] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
@@ -182,6 +183,7 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_all_compute_lens=forward_batch.extend_all_compute_len,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
@@ -423,11 +425,14 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                # last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                last_index = torch.cumsum(logits_metadata.extend_all_compute_lens, dim=0) - 1
             else:
+                ##todo mengyao_debug: fixme
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
                 # and this retrieves t01 and t12, which are the valid last tokens
+                raise "mengyao_debug, this shoud never happen."
                 idx = torch.arange(
                     len(logits_metadata.extend_seq_lens),
                     device=logits_metadata.extend_seq_lens.device,

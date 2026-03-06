@@ -661,11 +661,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    async def highlight_recompute_tokens(
+        self,
+        recompute_str_list: List[str]
+    ):
+        highlighted_tokens = []
+        for i, token in enumerate(recompute_str_list):
+            if i %2 == 1:
+                highlighted_tokens.append(f"\033[1;31m{token}\033[0m")  # 红色高亮
+            else:
+                highlighted_tokens.append(token)
+        highlighted_with_spaces = "".join(highlighted_tokens)
+        print(f"mengyao_debug highlight_recompute_tokens=\n{highlighted_with_spaces}")
+
+
     async def _find_recompute_token_in_one_request(
         self,
         recompute_str_list: List[str],
         is_cross_encoder_request:bool
     ):
+        await self.highlight_recompute_tokens(recompute_str_list)
         ## the first str doesn't need compute.
         cur_texts = ""
         recompute_idx = []
@@ -746,12 +761,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     import random
                     length = len(input_ids) - 1
                     if length > 0:
-                        recompute_length = int(len(input_ids) * 0.3)
+                        recompute_length = int(len(input_ids) * 0.2)
                         numbers = random.sample(range(length), recompute_length)
                         numbers.sort()
                         obj.fusionrag_params["recompute_idx"] = numbers
                     else:
                         obj.fusionrag_params["recompute_idx"] = [0]
+                    print(f"mengyao_debug recompute_idx = {obj.fusionrag_params['recompute_idx']}")
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):

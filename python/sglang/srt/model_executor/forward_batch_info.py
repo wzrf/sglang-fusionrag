@@ -286,7 +286,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
-    extend_recompute_len: Optional[torch.Tensor] = None
+    extend_all_compute_len: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
@@ -503,7 +503,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc, ret.extend_recompute_len = compute_position_with_recompute_indices( ##mengyao_debug hardcode
+            positions, ret.extend_start_loc, ret.extend_all_compute_len = compute_position_with_recompute_indices( ##mengyao_debug hardcode
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 all_compute_indices
