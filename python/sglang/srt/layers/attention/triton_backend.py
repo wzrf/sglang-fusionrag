@@ -421,6 +421,7 @@ class TritonAttnBackend(AttentionBackend):
             # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_all_compute_len, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+            # print(f"mengyao_debug extend_all_compute_len={forward_batch.extend_all_compute_len}")
             # custom_mask = None
             # mask_indptr = None
             attn_logits = None
@@ -814,6 +815,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        layer_id=0
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -876,6 +878,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
             full_indptr=self.forward_metadata.full_indptr,
+            layer_id=layer_id
         )
         # if os.environ.get("DEBUG", "0") == "1":
         #     layer_id = layer.layer_id
@@ -1361,6 +1364,7 @@ def make_custom_casual_mask(forward_batch: ForwardBatch):
     custom_mask_size = []
     custom_q_len = []
     custom_kv_len = []
+    all_compute_indices = [len(req.all_compute_idx) for req in forward_batch.reqs]
     for req in forward_batch.reqs:
         if len(req.all_compute_idx) == 0:
             custom_mask_size.append(req.seqlen * req.seqlen)
@@ -1378,7 +1382,7 @@ def make_custom_casual_mask(forward_batch: ForwardBatch):
     for batch_idx in range(batch_size):
         mask_indptr[batch_idx+1] = sum(custom_mask_size[:batch_idx+1])
 
-    print(mask_indptr)
+    # print(f"forward_batch={forward_batch.forward_mode}\nmengyao_debug mask_indptr = {mask_indptr}\nall_compute_indices={all_compute_indices}")
     for i in range(batch_size):
         if custom_q_len[i] == custom_kv_len[i]:
             causal_mask_ = (

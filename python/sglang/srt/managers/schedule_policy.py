@@ -741,12 +741,13 @@ class PrefillAdder:
                     req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                     if len(req.prefix_indices) >= len(req.fill_ids):
                         req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
-                    ### make sure it doesn't overflow
-                    req.recompute_idx = [idx for idx in req.recompute_idx if 0 <= idx < len(req.prefix_indices)]
                     req.hit_chunk_values = values_list
                     req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                     prefix_len = len(req.prefix_indices)
                     req.cache_protected_len = prefix_len
+
+            ### make sure it doesn't overflow
+            req.recompute_idx = [idx for idx in req.recompute_idx if idx < len(req.prefix_indices)]
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

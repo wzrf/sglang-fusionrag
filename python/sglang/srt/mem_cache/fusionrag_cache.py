@@ -269,20 +269,25 @@ class FusionragCache(RadixCache):
             cache_prefix_token_len = all_chunk_caches[2]
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[1]
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-            if host_indices is None:
-                raise "failed to allocate host indices"
-            self.cache_controller.mem_pool_host.set_from_length(
-                int(host_indices[0]),
-                prefetch_length,
-                chunk_tensor
-            )
-            node = ChunkNode()
-            node.text = text
-            node.cache_prefix_token_len = cache_prefix_token_len
-            node.host_value = host_indices
-            node.values = []
-            self.all_nodes.append(node)
+            try:
+                if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[0]:
+                    print(f"shape mismatch.")
+                    continue
+                host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+                if host_indices is None:
+                    raise "failed to allocate host indices"
+                self.cache_controller.mem_pool_host.set_from_indices(
+                    host_indices,
+                    chunk_tensor
+                )
+                node = ChunkNode()
+                node.text = text
+                node.cache_prefix_token_len = cache_prefix_token_len
+                node.host_value = host_indices
+                node.values = []
+                self.all_nodes.append(node)
+            except Exception as e:
+                print(f"unsupport layout detected.")
 
 
     def _parse_storage_backend_extra_config(

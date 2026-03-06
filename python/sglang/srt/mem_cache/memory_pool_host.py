@@ -228,7 +228,7 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def set_from_length(self, index: int, length:int, data_page: torch.Tensor) -> None:
+    def set_from_indices(self, host_indices: torch.Tensor, data_page: torch.Tensor) -> None:
         """
         Set a flat data page to the host memory pool.
         """
@@ -947,18 +947,13 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         ).flatten()
 
-    def set_from_length(self, index: int, length: int, data_page: torch.Tensor) -> None:
+    def set_from_indices(self, indices: torch.Tensor, data_page: torch.Tensor) -> None:
+        if self.layer_num != data_page.shape[0]:
+            raise ValueError(f"layer number mismatch: {self.layer_num}, data_page: {data_page.shape[0]}")
         if self.layout == "layer_first":
-            self.kv_buffer[:, index : index + length, :, :] = data_page.reshape(
+            self.kv_buffer[:, indices, :, :] = data_page.reshape(
                 self.layer_num,
-                length,
-                1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-            )
-        elif self.layout == "page_first":
-            self.kv_buffer[index : index + length, :, :, :] = data_page.reshape(
-                length,
-                self.layer_num,
+                len(indices),
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )

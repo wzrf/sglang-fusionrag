@@ -150,6 +150,8 @@ class DeepseekMHAForwardMixin:
                     dim=-1,
                 )
             ) ## fixme Q: [seq_len, 1536], latent_cache: [seq_len, 576]
+            # if self.layer_id == 0:
+            #     print(f"mengyao_debug q={q}, latent_cache={latent_cache}")
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
@@ -276,8 +278,9 @@ class DeepseekMHAForwardMixin:
                     q.dtype,
                     forward_batch,
                 )
-                # print(f"mengyao_debug kv_indices = {kv_indices}")
-                # print(f"mengyao_debug kv_a = {kv_a[0]}")
+                # if self.layer_id == 0:
+                #     print(f"mengyao_debug kv_indices = {kv_indices}")
+                #     print(f"mengyao_debug kv_a = {kv_a}")
         # if forward_batch.fusion_rag_indices is not None:  ## we are doing fusion rag
         #     # we load from kv cache rather than using the generate KV
         #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id).to(
@@ -301,6 +304,8 @@ class DeepseekMHAForwardMixin:
         v = kv[..., self.qk_nope_head_dim :] ## fixme v: [seq_len, 128, 128]
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch) ## fixme k_nope: [seq_len, 128, 192]
+        # if self.layer_id == 0:
+        #     print(f"mengyao_debug _concat_and_cast_mha_k k = {k}")
         return q, k, v, forward_batch
 
     def forward_normal_core_fusionrag_(
@@ -414,7 +419,9 @@ class DeepseekMHAForwardMixin:
             # q1 = copy.deepcopy(q)
             # k1 = copy.deepcopy(k)
             # v1 = copy.deepcopy(v)
-            attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            # if self.layer_id == 0:
+            #     print(f"mengyap_debug forward_normal_core_fusionrag q={q.shape}, k={k.shape}, v={v.shape}")
+            attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False, layer_id =self.layer_id)
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):

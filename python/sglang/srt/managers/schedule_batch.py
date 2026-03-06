@@ -1542,7 +1542,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                       f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%")
             else:
                 print(f"mengyao_debug compute percentage=100%")
-            # print(f"r.all_compute_idx = {r.all_compute_idx}")
+            # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")
+            # print(f"r.fill_ids = {len(r.fill_ids)}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
 

@@ -2371,7 +2371,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             torch.save(hidden_states, save_path)
 
 
-        # print(f"mengyao_debug prepare_attn hidden_states={hidden_states[-1][:5]}")
+        # if self.layer_id == 0:
+        #     # print(f"mengyao_debug prepare_attn positions={positions}")
+        #     print(f"mengyao_debug prepare_attn positions={positions.shape}")
+        #     print(f"mengyao_debug prepare_attn hidden_states={hidden_states.shape}")
         ## mengyao_debug
         hidden_states = self.self_attn(
             positions=positions,
@@ -3239,6 +3242,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        print(f"mengyao_debug input_ids={input_ids.shape}")
+        print(f"mengyao_debug positions={positions.shape}")
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(

@@ -769,6 +769,7 @@ def extend_attention_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     full_indptr=None,
+    layer_id=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -801,58 +802,100 @@ def extend_attention_fwd(
     # print(f"mengyao_debug q_shape = {q_extend.shape}\n grid = {grid}")
     num_stages = 1
 
+    # if layer_id == 0:
+    #     # print(f"mengyao_debug extend_attention_fwd before call locals()={locals()}")
+    #     print(f"mengyao_debug extend_attention_fwd q_extend shape={q_extend.shape}")
+    #     print(f"mengyao_debug extend_attention_fwd k_extend shape={k_extend.shape}")
+    #     print(f"mengyao_debug extend_attention_fwd v_extend shape={v_extend.shape}")
+    #     print(f"mengyao_debug extend_attention_fwd o_extend shape={o_extend.shape}")
+    #     print(f"mengyao_debug extend_attention_fwd qo_indptr shape={qo_indptr}")
+
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _fwd_kernel_fusionrag[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        full_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        sinks,
-        window_kv_offsets,
-        sm_scale,
-        kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        logit_cap=logit_cap,
-        xai_temperature_len=xai_temperature_len,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        IS_CAUSAL=is_causal,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        HAS_SINK=HAS_SINK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
-    )
+    try:
+        _fwd_kernel_fusionrag[grid](
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            full_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
+            sinks,
+            window_kv_offsets,
+            sm_scale,
+            kv_group_num,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            SLIDING_WINDOW_SIZE=sliding_window_size,
+            logit_cap=logit_cap,
+            xai_temperature_len=xai_temperature_len,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            Lq=Lq,
+            Lv=Lv,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            IS_CAUSAL=is_causal,
+            SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+            HAS_SINK=HAS_SINK,
+            STORE_TRANSPOSE=_is_hip,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **extra_kargs,
+        )
+    except RuntimeError as e:
+        print(f"捕获到 RuntimeError: {e} layer_id={layer_id}")
+        print("qo_indptr:")
+        print(qo_indptr)
+        print("kv_indptr:")
+        print(kv_indptr)
+        print("full_indptr:")
+        print(full_indptr)
+        print("kv_indices:")
+        print(kv_indices)
+        print("mask_indptr:")
+        print(mask_indptr)
+        print("q_extend:")
+        print(q_extend)
+        print("k_extend:")
+        print(k_extend)
+        print("v_extend:")
+        print(v_extend)
+        print("o_extend:")
+        print(o_extend)
+        print("k_buffer:")
+        print(k_buffer)
+        print("v_buffer:")
+        print(v_buffer)
+        print("sinks:")
+        print(sinks)
+        print("window_kv_offsets:")
+        print(window_kv_offsets)
+        print("sm_scale:")
+        print(sm_scale)
+        print("kv_group_num:")
+        print(kv_group_num)
+        print("=== 打印完成 ===")
 
 
 def redundant_attention(
