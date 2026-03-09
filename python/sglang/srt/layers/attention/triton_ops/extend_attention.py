@@ -865,6 +865,10 @@ def extend_attention_fwd(
         )
     except RuntimeError as e:
         print(f"捕获到 RuntimeError: {e} layer_id={layer_id}")
+        print(f"mengyao_debug extend_attention_fwd q_extend shape={q_extend_shape}")
+        print(f"mengyao_debug extend_attention_fwd k_extend shape={k_extend_shape}")
+        print(f"mengyao_debug extend_attention_fwd v_extend shape={v_extend_shape}")
+        print(f"mengyao_debug extend_attention_fwd o_extend shape={o_extend_shape}")
         print("qo_indptr:")
         print(qo_indptr)
         print("kv_indptr:")

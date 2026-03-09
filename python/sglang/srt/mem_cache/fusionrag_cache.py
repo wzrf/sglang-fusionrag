@@ -462,8 +462,8 @@ class FusionragCache(RadixCache):
                 break
             finish_count += 1
             # no need to sync across TP workers as batch forwarding is synced
-            for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
+            # for ack_id in ack_list:
+            #     end_node = self.ongoing_load_back.pop(ack_id)
                 # self.dec_lock_ref(end_node)
 
         # ACK until all events are processed
@@ -672,7 +672,10 @@ class FusionragCache(RadixCache):
         ##todo 还是把prefix_len改成对的吧
         self.cache_controller.mem_pool_device_allocator.free(kv_indices)
         for i, node in enumerate(req.hit_chunk_nodes):
-            node.values.remove(req.hit_chunk_values[i].value)
+            try:
+                node.values.remove(req.hit_chunk_values[i].value)
+            except Exception as E:
+                print(f"cache finish req error. node={node}, value ={req.hit_chunk_values[i].value}")
 
         self.req_to_token_pool.free(req.req_pool_idx)
 

@@ -2905,6 +2905,7 @@ class DeepseekV2Model(nn.Module):
 
         ""
 
+    ##todo: triton
     def fix_rope_test(
         self,
         forward_batch
@@ -3242,8 +3243,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        print(f"mengyao_debug input_ids={input_ids.shape}")
-        print(f"mengyao_debug positions={positions.shape}")
+        # print(f"mengyao_debug input_ids={input_ids.shape}")
+        # print(f"mengyao_debug positions={positions.shape}")
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
