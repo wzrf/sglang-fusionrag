@@ -912,12 +912,10 @@ class Req:
                 self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
                 self.host_hit_length = match_result.host_hit_length
                 self.prefix_indices = match_result.device_indices ## empty
-                if self.is_kv_gen is True:
-                    if self.host_hit_length == len(self.origin_input_ids):
-                        print(f"req doesn't need to be run.")
-                        self.no_need_to_run = True
+                if match_result.no_need_to_run:
+                    print(f"req doesn't need to be run.")
+                    self.no_need_to_run = True
 
-                # self.prefix_indices = torch.tensor([]) ## mengyao_debug let it be empty, we will read it later.
             else:
                 (
                     self.prefix_indices,
@@ -1539,7 +1537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a DECODER TASK")
             if len(r.prefix_indices) >0:
                 print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%")
+                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
             else:
                 print(f"mengyao_debug compute percentage=100%")
             # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")

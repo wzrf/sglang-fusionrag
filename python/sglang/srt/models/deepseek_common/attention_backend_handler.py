@@ -169,7 +169,7 @@ def handle_attention_triton(attn, forward_batch):
         # and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         # return AttnForwardMethod.MHA
-        return AttnForwardMethod.MHA_ONE_SHOT
+        return AttnForwardMethod.MHA_ONE_SHOT ## mengyao_debug hardcode
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
 

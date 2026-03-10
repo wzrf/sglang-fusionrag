@@ -60,7 +60,8 @@ class ChunkNode:
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
-        self.text: str = ""
+        self.prefix_text: str = ""
+        self.text_without_prefix: str = ""
         self.cache_prefix_token_len : int = 0
         self.values: Optional[List[torch.Tensor]] = None
         self.evictable_values: Optional[List[torch.Tensor]] = None
@@ -253,9 +254,10 @@ class FusionragCache(RadixCache):
                     try:
                         with open(metadata_path, 'r', encoding='utf-8') as f:
                             metadata = json.load(f)
-                        text = metadata.get("text", "")
+                        text_without_prefix = metadata.get("text", "")
                         cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
-                        result.append((text, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len))
+                        prefix_text = metadata.get("prefix_text", "")
+                        result.append((text_without_prefix, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len, prefix_text))
 
                     except (json.JSONDecodeError, KeyError) as e:
                         print(f"Error reading {metadata_path}: {e}")
@@ -264,9 +266,10 @@ class FusionragCache(RadixCache):
 
     def load_all_from_ssd(self):
         for all_chunk_caches in self.list_all_chunk_caches(raw_cache=True):
-            text = all_chunk_caches[0]
+            text_without_prefix = all_chunk_caches[0]
             tensor_path = all_chunk_caches[1]
             cache_prefix_token_len = all_chunk_caches[2]
+            prefix_text = all_chunk_caches[3]
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[1]
             try:
@@ -281,7 +284,8 @@ class FusionragCache(RadixCache):
                     chunk_tensor
                 )
                 node = ChunkNode()
-                node.text = text
+                node.text_without_prefix = text_without_prefix
+                node.prefix_text = prefix_text
                 node.cache_prefix_token_len = cache_prefix_token_len
                 node.host_value = host_indices
                 node.values = []
@@ -557,15 +561,36 @@ class FusionragCache(RadixCache):
         last_round_found = True
         if len(input_text) == 0:
             print(f"mengyao_debug fusionrag cache match_prefix skipping prefix.")
-        while len(input_text) > 0 and last_round_found:
-            last_round_found = False
+        if params.key.is_kv_gen:
+            ## 如果是kv gen，只match一次
             for node in self.all_nodes:
-                if input_text.startswith(node.text):
-                    print(f"load text: {node.text[:20]}")
-                    host_hit_length += len(node.host_value)
-                    all_hit_chunk_nodes.append(node)
-                    input_text = input_text[len(node.text) :]
-                    last_round_found = True
+                prefix_text = params.key.prefix_prompt_text
+                text_without_prefix = params.key.origin_input_text[len(prefix_text):]
+                print(f"kv gen already run before\ntext={text_without_prefix}\nprefix={prefix_text}")
+                if text_without_prefix == node.text_without_prefix and prefix_text == node.prefix_text:
+                    return MatchResult(
+                        device_indices=torch.empty(
+                            (0,),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),  ## mengyao_debug let all be empty on the device.
+                        all_hit_chunk_nodes=all_hit_chunk_nodes,
+                        host_hit_length=host_hit_length,
+                        last_host_node=None,
+                        last_device_node=None,
+                        no_need_to_run=True,
+                    )
+
+        else:
+            while len(input_text) > 0 and last_round_found:
+                last_round_found = False
+                for node in self.all_nodes:
+                    if input_text.startswith(node.text_without_prefix):
+                        print(f"load text: {node.text_without_prefix[:20]}")
+                        host_hit_length += len(node.host_value)
+                        all_hit_chunk_nodes.append(node)
+                        input_text = input_text[len(node.text_without_prefix) :]
+                        last_round_found = True
 
         return MatchResult(
             device_indices=torch.empty(
@@ -577,6 +602,7 @@ class FusionragCache(RadixCache):
             host_hit_length=host_hit_length,
             last_host_node=None,
             last_device_node=None,
+            no_need_to_run=False,
         )
 
     def insert(
@@ -586,12 +612,15 @@ class FusionragCache(RadixCache):
         chunked: bool = False,
         priority: int | None = None,
         is_kv_gen: bool = False,
+        kv_gen_prefix_len: int = 0,
     ):
         if is_kv_gen:
             node = ChunkNode()
-            node.text = key.origin_input_text
+            node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
+            node.prefix_text = key.prefix_prompt_text
             node.values = [value]
             node.priority = priority
+            node.cache_prefix_token_len = kv_gen_prefix_len
             self.all_nodes.append(node)
             ## 把数据写回主存里
             self.write_backup(node)
@@ -658,9 +687,15 @@ class FusionragCache(RadixCache):
             radix_key = RadixKey(
                 token_ids=token_ids,
                 origin_input_text=req.origin_input_text,
+                prefix_prompt_text=req.prefix_prompt,
             )
             values = kv_indices.to(dtype=torch.int64, copy=True)
-            self.insert(radix_key, values, priority=0, is_kv_gen=True)
+            self.insert(
+                radix_key,
+                values[req.kv_gen_prefix_len:],
+                priority=0,
+                is_kv_gen=True,
+                kv_gen_prefix_len=req.kv_gen_prefix_len)
             self._write_cache_to_disk(req, kv_indices)
 
         ## either case 都要把显存清理掉，要把output_ids部分也清理掉
@@ -679,8 +714,9 @@ class FusionragCache(RadixCache):
 
         self.req_to_token_pool.free(req.req_pool_idx)
 
-    def _write_cache_to_disk(self, req: Req, kv_indices: torch.Tensor) -> None:
+    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor) -> None:
         kv_cache = []
+        kv_indices = kv_indices_[req.kv_gen_prefix_len:]
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices].to('cpu')
             kv_cache.append(k_buffer)

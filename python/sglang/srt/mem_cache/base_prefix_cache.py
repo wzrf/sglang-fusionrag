@@ -63,8 +63,10 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+    kv_cache_gen_prefix_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     all_hit_chunk_nodes: Any = None
+    no_need_to_run: bool = False
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

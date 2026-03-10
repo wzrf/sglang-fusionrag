@@ -117,6 +117,7 @@ class SchedulePolicy:
                 )
             return False
 
+        raise "unknown policy" ## mengyao_debug, make the prefix match easier.
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
