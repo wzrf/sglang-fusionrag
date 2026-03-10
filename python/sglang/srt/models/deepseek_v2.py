@@ -2910,6 +2910,8 @@ class DeepseekV2Model(nn.Module):
         self,
         forward_batch
     ):
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
         if forward_batch is None or forward_batch.reqs is None:
             return
         for req in forward_batch.reqs:
