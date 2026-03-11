@@ -265,7 +265,7 @@ class DeepseekMHAForwardMixin:
         ##todo: this will never happen on fusion rag case.
         if (
             forward_batch.mha_one_shot
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+            # and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
@@ -514,12 +514,12 @@ class DeepseekMHAForwardMixin:
         # print(f"mengyao_debug forward_normal_one_shot_core q={q[-1][0][:5]}")
         # print(f"mengyao_debug forward_normal_one_shot_core k={k[-1][0][:5]}")
         # print(f"mengyao_debug forward_normal_one_shot_core v={v[-1][0][:5]}")
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        # has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # # Only initialize the info once
+        # if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+        #     forward_batch.num_prefix_chunks = 0
+        #     if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+        #         forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)

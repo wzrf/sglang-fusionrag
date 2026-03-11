@@ -566,8 +566,8 @@ class FusionragCache(RadixCache):
             for node in self.all_nodes:
                 prefix_text = params.key.prefix_prompt_text
                 text_without_prefix = params.key.origin_input_text[len(prefix_text):]
-                print(f"kv gen already run before\ntext={text_without_prefix}\nprefix={prefix_text}")
                 if text_without_prefix == node.text_without_prefix and prefix_text == node.prefix_text:
+                    print(f"kv gen already run before\ntext={text_without_prefix}\nprefix={prefix_text}")
                     return MatchResult(
                         device_indices=torch.empty(
                             (0,),

@@ -162,6 +162,8 @@ def handle_attention_triton(attn, forward_batch):
 
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
+        if forward_batch.forward_mode.is_extend():
+            return AttnForwardMethod.MHA_ONE_SHOT
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (

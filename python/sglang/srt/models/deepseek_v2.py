@@ -2642,7 +2642,7 @@ class DeepseekV2Model(nn.Module):
         self.cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2/raw_kv_cache"
         self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
         print(f"debug = {os.environ.get('DEBUG')}")
-        if os.environ.get("DEBUG", "0") == "1":
+        if os.environ.get("DEBUG", "0") != "0":
             self.cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/raw_kv_cache"
             self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
 
