@@ -231,7 +231,7 @@ class FusionragCache(RadixCache):
             cache_path_root = "/mnt/data"
         self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/raw_kv_cache"
         self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/preprocess_kv_cache"
-        if os.environ.get("DEBUG", "0") == "1":
+        if os.environ.get("DEBUG", "0") != "0":
             self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/raw_kv_cache"
             self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
@@ -512,8 +512,8 @@ class FusionragCache(RadixCache):
                 host_indices=host_indices, node_id=last_hit_node.id
             )
         if device_indices is None:
+            raise Exception(f"not enough HBM to load")
             # no sufficient GPU memory to load back KV caches
-            return None
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         all_values = []
@@ -671,6 +671,7 @@ class FusionragCache(RadixCache):
         return self.cache_controller.start_loading()
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        print(f"cache_unfinished_req")
         ""
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
@@ -699,7 +700,8 @@ class FusionragCache(RadixCache):
             self._write_cache_to_disk(req, kv_indices)
 
         ## either case 都要把显存清理掉，要把output_ids部分也清理掉
-        token_ids = (req.origin_input_ids + req.output_ids)
+        kv_committed_len = req.pop_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -710,7 +712,7 @@ class FusionragCache(RadixCache):
             try:
                 node.values.remove(req.hit_chunk_values[i].value)
             except Exception as E:
-                print(f"cache finish req error. node={node}, value ={req.hit_chunk_values[i].value}")
+                print(f"cache finish req error. E={E}, node={node.values}, value ={req.hit_chunk_values[i].value}")
 
         self.req_to_token_pool.free(req.req_pool_idx)
 

@@ -2732,10 +2732,10 @@ class DeepseekV2Model(nn.Module):
         self.fix_rope_test(forward_batch)
 
         origin_positions = None
-        if forward_batch.forward_mode == ForwardMode.EXTEND and\
-            len(forward_batch.reqs) == 1 and forward_batch.reqs[0].hit_chunk_nodes is not None \
-            and len(forward_batch.reqs[0].hit_chunk_nodes) > 0:
-            forward_batch.fusion_rag_indices = positions
+        # if forward_batch.forward_mode == ForwardMode.EXTEND and\
+        #     len(forward_batch.reqs) == 1 and forward_batch.reqs[0].hit_chunk_nodes is not None \
+        #     and len(forward_batch.reqs[0].hit_chunk_nodes) > 0:
+        #     forward_batch.fusion_rag_indices = positions
 
         # recompute_idx = self.find_recompute_idx(forward_batch)
         # if recompute_idx is not None:

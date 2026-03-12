@@ -262,6 +262,10 @@ class DeepseekMHAForwardMixin:
         if is_extend_and_debug(forward_batch):
             save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(latent_cache, save_path)
+
+        def has_duplicates(tensor):
+            # 展平后比较元素总数与唯一元素个数
+            return tensor.numel() != torch.unique(tensor).numel()
         ##todo: this will never happen on fusion rag case.
         if (
             forward_batch.mha_one_shot
@@ -272,7 +276,15 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                kv_indices = forward_batch.fetch_mha_one_shot_kv_indices(),
+                kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+                if self.layer_id == 0:
+                    print(f"mengyao_debug kv_indice={kv_indices}")
+                    if has_duplicates(kv_indices):
+                        torch.set_printoptions(threshold=10000)
+                        print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, "
+                              f"req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
+                        torch.set_printoptions(threshold=1000)
+                        raise "HAS DUPLICATES"
                 kv_a, k_pe = self._get_mla_kv_buffer(
                     forward_batch.fetch_mha_one_shot_kv_indices(),
                     q.dtype,
@@ -419,8 +431,8 @@ class DeepseekMHAForwardMixin:
             # q1 = copy.deepcopy(q)
             # k1 = copy.deepcopy(k)
             # v1 = copy.deepcopy(v)
-            # if self.layer_id == 0:
-            #     print(f"mengyap_debug forward_normal_core_fusionrag q={q.shape}, k={k.shape}, v={v.shape}")
+            if self.layer_id == 0:
+                print(f"mengyap_debug forward_normal_core_fusionrag q={q.shape}, k={k.shape}, v={v.shape}")
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False, layer_id =self.layer_id)
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
         tp_size = get_tensor_model_parallel_world_size()
