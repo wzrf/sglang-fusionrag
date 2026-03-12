@@ -708,11 +708,15 @@ class FusionragCache(RadixCache):
         ##todo 这里有问题，prefix_len 设置成了0，所以只把alloc_extend申请的内存free掉了，但是prefix的内存没有free掉。
         ##todo 还是把prefix_len改成对的吧
         self.cache_controller.mem_pool_device_allocator.free(kv_indices)
-        for i, node in enumerate(req.hit_chunk_nodes):
+        for node_idx, node in enumerate(req.hit_chunk_nodes):
+            value_to_remove = req.hit_chunk_values[node_idx].value
             try:
-                node.values.remove(req.hit_chunk_values[i].value)
+                for value_idx, value in enumerate(node.values):
+                    if torch.equal(value, value_to_remove):  # 比较内容是否完全一致
+                        del node.values[value_idx]
+                        break
             except Exception as E:
-                print(f"cache finish req error. E={E}, node={node.values}, value ={req.hit_chunk_values[i].value}")
+                print(f"cache finish req error. E={E}, node={node}, value ={req.hit_chunk_values[i].value}")
 
         self.req_to_token_pool.free(req.req_pool_idx)
 
