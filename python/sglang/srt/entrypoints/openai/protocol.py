@@ -277,7 +277,7 @@ class CompletionRequest(BaseModel):
     @classmethod
     def validate_max_tokens_positive(cls, v):
         if v is not None and v < 0:
-            raise ValueError("max_tokens must be positive or zero(mengyao_debug)")
+            raise ValueError("max_tokens must be non-negative")
         return v
 
 

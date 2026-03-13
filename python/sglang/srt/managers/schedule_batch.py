@@ -553,13 +553,26 @@ class Req:
         self.recompute_idx: List[int] = []
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
+
         if fusionrag_params is not None:
+            logger.error(
+                "检查环节：fusionrag_params received in Req: "
+                f"save_cache={fusionrag_params.get('save_cache', False)} "
+                f"save_raw_cache={fusionrag_params.get('save_raw_cache', False)} "
+                f"save_preprocess_cache={fusionrag_params.get('save_preprocess_cache', False)} "
+                f"keys={list(fusionrag_params.keys())}"
+            )
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
-            self.save_preprocess_cache = fusionrag_params.get("preprocess", False)
+            self.save_preprocess_cache = fusionrag_params.get(
+                "save_preprocess_cache", False
+            )
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
-            self.save_raw_cache = not self.save_preprocess_cache
+            self.save_raw_cache = fusionrag_params.get("save_raw_cache", False)
+            if not self.save_raw_cache and not self.save_preprocess_cache:
+                # Default to raw cache when save_cache is requested without explicit flags.
+                self.save_raw_cache = self.is_kv_gen
             fusionrag_params = None
         else:
             self.is_kv_gen = False
@@ -568,7 +581,9 @@ class Req:
             self.save_preprocess_cache = False
             self.save_raw_cache = False
             self.recompute_idx = []
-
+        # shm debug
+        # self.is_kv_gen = True
+        
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 

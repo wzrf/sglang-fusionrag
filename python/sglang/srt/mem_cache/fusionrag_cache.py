@@ -136,7 +136,7 @@ class FusionragCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        if isinstance(self.kv_cache, MHATokenToKVPool): # QWEN用的是这个？
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -227,13 +227,13 @@ class FusionragCache(RadixCache):
         self.eviction_strategy: EvictionStrategy = LRUStrategy()
 
         cache_path_root = "/mnt/data3"
-        if not os.path.exists(cache_path_root):
-            cache_path_root = "/mnt/data"
-        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/raw_kv_cache"
-        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/DeepSeek-v3.2/preprocess_kv_cache"
+        # if not os.path.exists(cache_path_root):
+        #     cache_path_root = "/mnt/data"
+        self.cache_path = f"/mnt/data3/shm/fusionrag_tree_cache/DeepSeek-v3.2/raw_kv_cache"
+        self.preprocess_cache_path = f"/mnt/data3/shm/fusionrag_tree_cache/DeepSeek-v3.2/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/raw_kv_cache"
-            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
+            self.cache_path = f"/mnt/data3/shm/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/raw_kv_cache"
+            self.preprocess_cache_path = f"/mnt/data3shm/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -677,6 +677,11 @@ class FusionragCache(RadixCache):
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
+        logger.error(
+            f"fusionrag cache_finished_req: rid={req.rid} "
+            f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
+            f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run}"
+        )
         if req.no_need_to_run:
             return
         if req.is_kv_gen:
@@ -739,16 +744,21 @@ class FusionragCache(RadixCache):
         md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
         if req.save_preprocess_cache is True:
             passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
-            print(f"mengyao_debug save to PREPROCESS cache\n"
-                  f"text=\n{text[len(prefix_prompt):]}\n"
-                  f"prefix=\n{prefix_prompt}")
+            logger.error(
+                "save to PREPROCESS cache\n"
+                f"text=\n{text[len(prefix_prompt):]}\n"
+                f"prefix=\n{prefix_prompt}"
+            )
         elif req.save_raw_cache is True:
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
-            print(f"mengyao_debug save to RAW cache\n"
-                  f"text=\n{text[len(prefix_prompt):][:20]}\n"
-                  f"prefix=\n{prefix_prompt}")
+            logger.error(
+                "save to RAW cache\n"
+                f"text=\n{text[len(prefix_prompt):][:20]}\n"
+                f"prefix=\n{prefix_prompt}"
+            )
         else:
-            raise "either save_preprocess_cache or save_raw_cache must be True"
+            raise ValueError("either save_preprocess_cache or save_raw_cache must be True")
+        logger.error(f"cache save path: {passage_kv_path}")
         os.makedirs(passage_kv_path, exist_ok=True)
         metadata_file_path = f"{passage_kv_path}/metadata.json"
         with open(metadata_file_path, 'w') as f:

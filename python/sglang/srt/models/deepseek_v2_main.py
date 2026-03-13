@@ -26,8 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-# Added for FusionRAG: 增加工具库用于缓存文件的 md5 计算、元数据存储及深拷贝
-import hashlib, json, copy
+
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -117,7 +116,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -129,15 +128,19 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _device_sm,
+    _get_llama_4_scaling,
     _is_cpu,
     _is_cpu_amx_available,
+    _is_cublas_ge_129,
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
+    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -147,7 +150,6 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_non_idle_and_non_empty,
-    is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -194,8 +196,6 @@ elif _is_npu:
 else:
     pass
 
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
-
 logger = logging.getLogger(__name__)
 
 
@@ -208,7 +208,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
 ]
 
-RUN_IDX = 0
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -468,7 +467,9 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -510,6 +511,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -530,7 +532,9 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -573,7 +577,6 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
-                    forward_batch
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -617,7 +620,6 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
-        forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -637,15 +639,6 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-
-        global RUN_IDX
-        # Added for FusionRAG Debug: 如果处于扩展阶段且开启了调试，则保存 Router 的 Logits 和 TopK 权重到指定路径
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/router_logits_{self.layer_id}_tp_{0}_runidx_{RUN_IDX}.pt"
-            torch.save(router_logits, save_path)
-            save_path = f"/mnt/data3/shm/fusionrag/debug/topk_output_{self.layer_id}_tp_{0}_runidx_{RUN_IDX}.pt"
-            torch.save(topk_output.topk_weights, save_path)
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -749,8 +742,6 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
@@ -895,6 +886,52 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+            # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -909,13 +946,17 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            # aiter moe call will handle routed_scaling_factor in the function
+            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
+            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if not (
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -1014,24 +1055,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    # Broadcast over num_heads and head_dim
-    return scaling[..., None, None]
 
 
 class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
@@ -1187,10 +1210,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
+        self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim, ## 512+64
+            self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
             layer_id=layer_id,
@@ -1201,7 +1225,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
-            self.qk_nope_head_dim + self.qk_rope_head_dim, ## 128+64
+            self.qk_nope_head_dim + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
@@ -1330,26 +1354,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
-        origin_positions=None, # Added for FusionRAG: 原始位置信息，用于修正 RoPE
     ):
-        tp_size = get_tensor_model_parallel_world_size()
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
-            origin_positions=origin_positions,
         )
-        global RUN_IDX
-        # Added for FusionRAG Debug: 保存注意力机制准备阶段产生的 Q, K, V 张量
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/forward_prepare_q_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
-            torch.save(s[3][0], save_path)
-            save_path = f"/mnt/data3/shm/fusionrag/debug/forward_prepare_k_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
-            torch.save(s[3][1], save_path)
-            save_path = f"/mnt/data3/shm/fusionrag/debug/forward_prepare_v_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
-            torch.save(s[3][2], save_path)
         return self.forward_core(s)
 
     def forward_prepare(
@@ -1359,7 +1371,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
-        origin_positions=None # Added for FusionRAG
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1384,11 +1395,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
 
-        global RUN_IDX
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator, origin_positions
+                positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
@@ -1396,7 +1406,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
-                positions, hidden_states, forward_batch, zero_allocator, origin_positions, RUN_IDX
+                positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
@@ -2327,10 +2337,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
-        origin_positions=None
     ) -> torch.Tensor:
-
-        tp_rank = get_attention_tp_rank()
         quant_format = (
             "mxfp4"
             if (
@@ -2357,60 +2364,25 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
-        global RUN_IDX
-        tp_size = get_tensor_model_parallel_world_size()
-        # Added for FusionRAG Debug: 保存该层初始的 hidden_states
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/init_hidden_states_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
-        ## mengyao_debug
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             quant_format,
         )
-        # Added for FusionRAG Debug: 保存经过通信准备（如 All-Gather）后的 hidden_states
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/prepare_attn_hidden_states_{self.layer_id}_tp_{tp_size}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
 
-
-        # if self.layer_id == 0:
-        #     # print(f"mengyao_debug prepare_attn positions={positions}")
-        #     print(f"mengyao_debug prepare_attn positions={positions.shape}")
-        #     print(f"mengyao_debug prepare_attn hidden_states={hidden_states.shape}")
-        ## mengyao_debug
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
-            origin_positions=origin_positions,
         )
-        # Added for FusionRAG Debug: 保存 Attention 计算后的结果
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/self_attn_hidden_states_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     if is_fusionrag_load_cache(forward_batch):
-        #         save_path = f"/mnt/data3/shm/fusionrag/debug/run_prepare_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     else:
-        #         save_path = f"/mnt/data3/shm/fusionrag/debug/cache_prepare_mlp_hidden_states_{self.layer_id}_tp_{tp_size}.pt"
-        #     torch.save(hidden_states, save_path)
-
-        # Added for FusionRAG Debug: 保存进入 MLP 之前的 hidden_states 和 residual
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/prepare_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
-            save_path = f"/mnt/data3/shm/fusionrag/debug/prepare_mlp_residual_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
-            torch.save(residual, save_path)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2425,7 +2397,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
-        ## mengyao_debug
+
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
@@ -2433,10 +2405,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
-        # Added for FusionRAG Debug: 保存 MLP 计算后的 hidden_states
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/hidden_states_mlp_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2445,10 +2413,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-        # Added for FusionRAG Debug: 保存经过 All-Reduce 融合后的最终 hidden_states
-        if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/shm/fusionrag/debug/hidden_states_allreduce_{self.layer_id}_tp_{tp_size}_rank_{tp_rank}_runidx_{RUN_IDX}.pt"
-            torch.save(hidden_states, save_path)
 
         return hidden_states, residual
 
@@ -2547,7 +2511,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -2557,7 +2521,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        # config.num_hidden_layers = 5
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -2617,7 +2581,16 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    tp_size = get_tensor_model_parallel_world_size()
+                    # tp_size = get_tensor_model_parallel_world_size()
+                    a2a_backend = get_moe_a2a_backend()
+                    is_a2a_moe = (
+                        a2a_backend.is_deepep()
+                        or a2a_backend.is_mori()
+                        or a2a_backend.is_mooncake()
+                    )
+                    tp_size = (
+                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
+                    )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -2644,23 +2617,6 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
-        # FusionRAG Cache Path Setup: 设置 KV 缓存的存储路径（原始缓存和预处理后的缓存）
-        tp_size_ = get_tensor_model_parallel_world_size()
-        cache_path_root = "/mnt/data3"
-        if not os.path.exists(cache_path_root):
-            cache_path_root = "/mnt/data"
-        self.cache_path = f"{cache_path_root}/shm/fusionrag/DeepSeek-v3.2/raw_kv_cache"
-        self.preprocess_cache_path = f"{cache_path_root}/shm/fusionrag/DeepSeek-v3.2/preprocess_kv_cache"
-        print(f"debug = {os.environ.get('DEBUG')}")
-        if os.environ.get("DEBUG", "0") != "0":
-            # 调试模式下使用带 TP 标识的路径
-            self.cache_path = f"{cache_path_root}/shm/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/raw_kv_cache"
-            self.preprocess_cache_path = f"{cache_path_root}/shm/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
-
-        print(f"cache_path = {self.cache_path}")
-        os.makedirs(self.cache_path, exist_ok=True)
-        os.makedirs(self.preprocess_cache_path, exist_ok=True)
-
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2672,8 +2628,6 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        global RUN_IDX
-        RUN_IDX += 1
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -2707,15 +2661,9 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        hidden_states_origin_shape = hidden_states.shape
-        
-        # FusionRAG: 检查该请求是否已经计算过缓存，如果是则跳过计算直接返回
-        if self.check_if_cache_calculated_before(forward_batch):
-            return hidden_states
 
         if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
-                #mengyao_debug
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
@@ -2742,33 +2690,6 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        
-        # FusionRAG: 尝试修复命中的块缓存中的 RoPE 旋转
-        self.fix_rope_test(forward_batch)
-
-        origin_positions = None
-        # if forward_batch.forward_mode == ForwardMode.EXTEND and\
-        #     len(forward_batch.reqs) == 1 and forward_batch.reqs[0].hit_chunk_nodes is not None \
-        #     and len(forward_batch.reqs[0].hit_chunk_nodes) > 0:
-        #     forward_batch.fusion_rag_indices = positions
-
-        # recompute_idx = self.find_recompute_idx(forward_batch)
-        # if recompute_idx is not None:
-        #     origin_positions = copy.deepcopy(positions)
-        #     positions = recompute_idx.to(positions.device)
-        #     hidden_states = hidden_states[positions]
-        #     forward_batch.fusion_rag_indices = positions
-
-        # new_positions = self.load_kv_cache_to_hbm(forward_batch=forward_batch,
-        #                           dtype=hidden_states.dtype,
-        #                           device=hidden_states.device,
-        #                             positions=positions)
-        # if new_positions is not None:
-        #     origin_positions = copy.deepcopy(positions)
-        #     positions = new_positions.to(positions.device)
-        #     hidden_states = hidden_states[positions]
-
-
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2786,7 +2707,6 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                ## mengyao_debug
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
@@ -2795,16 +2715,7 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
-                    origin_positions
                 )
-                # print(f"mengyao_debug hidden_states shape={hidden_states.shape}")
-                # print(f"mengyao_debug hidden_states {hidden_states[-1][:5]}")
-
-        # self.save_kv_cache_to_disk(
-        #     forward_batch,
-        #     dtype=hidden_states.dtype,
-        #     positions=positions
-        # )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2845,248 +2756,6 @@ class DeepseekV2Model(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
-
-    def check_if_cache_calculated_before(self, forward_batch):
-        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
-            if forward_batch.forward_mode == ForwardMode.EXTEND \
-            and forward_batch.reqs[0].fusionrag_params is not None \
-            and forward_batch.reqs[0].fusionrag_params.get("save_cache", False) is True: ## only happens when compute and save cache.
-                text = forward_batch.reqs[0].origin_input_text
-                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
-                if forward_batch.reqs[0].fusionrag_params.get("save_preprocess_cache", False) is True:
-                    raw_cache = False
-                else:
-                    raw_cache = True
-                all_chunk_cache = self.list_all_chunk_caches(raw_cache=raw_cache)
-                all_texts = [
-                    cache[0] for cache in all_chunk_cache
-                ]
-                if text[len(prefix_prompt):] in all_texts:
-                    if raw_cache:
-                        print(f"[check_if_cache_calculated_before] RAW cache: text=\n{text[len(prefix_prompt):]}\nprefix=\n{prefix_prompt}\n")
-                    else:
-                        print(f"[check_if_cache_calculated_before] PREPROCESS cache: text=\n{text[len(prefix_prompt):]}\nprefix=\n{prefix_prompt}\n")
-                    return True
-        return False
-
-
-
-    def save_kv_cache_to_disk(
-        self,
-        forward_batch,
-        dtype,
-        positions,
-    ):
-        """
-        FusionRAG: 将计算得到的 KV 缓存持久化到磁盘。
-        根据文档内容计算 MD5 哈希作为标识，存储 KV 张量 (.pt) 和文本元数据 (metadata.json)。
-        支持 RAW (原始 KV) 和 PREPROCESS (包含中间层信息) 两种模式。
-        """
-        tp_rank = get_attention_tp_rank()
-        if forward_batch.forward_mode == ForwardMode.EXTEND: ## 仅在 Prefill 阶段保存
-            if forward_batch.extend_seq_lens_cpu is not None:
-                for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
-                    kv_cache = []
-                    text = forward_batch.reqs[i].origin_input_text
-                    if forward_batch.reqs[i].fusionrag_params is not None and forward_batch.reqs[i].fusionrag_params.get("save_cache", False) is True:
-                        cache_start_idx = sum(forward_batch.extend_seq_lens_cpu[:i])
-                        cache_end_idx = sum(forward_batch.extend_seq_lens_cpu[:i+1])
-                        cache_prefix_token_len = len(forward_batch.reqs[i].fusionrag_params["prefix_prompt_ids"])
-                        prefix_prompt = forward_batch.reqs[i].fusionrag_params.get("prefix_prompt", "")
-                        
-                        # 逐层提取 KV 数据并搬运至 CPU
-                        for layer_id in range(len(self.layers)):
-                            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id).to(
-                                dtype
-                            )[forward_batch.out_cache_loc[cache_start_idx+cache_prefix_token_len: cache_end_idx], :, :].to('cpu')
-                            kv_cache.append(k_buffer)
-                        
-                        # 堆叠所有层的 KV 数据
-                        kv_cache = torch.stack(kv_cache, dim=0)
-                        
-                        if not text.startswith(prefix_prompt):
-                            print(f"mengyao_debug not start with prefix!\nprefix={forward_batch.reqs[i].fusionrag_params['prefix_prompt']}\ntext={text}")
-                        
-                        # 准备元数据，剔除 prefix_prompt 仅保留文档正文
-                        metadata = {
-                            "text": text[len(prefix_prompt):],
-                            "cache_prefix_token_len": cache_prefix_token_len,
-                            "prefix_text": prefix_prompt
-                        }
-                        md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
-                        
-                        # 确定存储路径
-                        if forward_batch.reqs[i].fusionrag_params.get("save_preprocess_cache", False) is True:
-                            passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
-                            print(f"mengyao_debug save to PREPROCESS cache\n"
-                                  f"text=\n{text[len(prefix_prompt):]}\n"
-                                  f"prefix=\n{prefix_prompt}")
-                        else:
-                            passage_kv_path = f"{self.cache_path}/{md5_hash}"
-                            print(f"mengyao_debug save to RAW cache\n"
-                                  f"text=\n{text[len(prefix_prompt):]}\n"
-                                  f"prefix=\n{prefix_prompt}")
-                        
-                        os.makedirs(passage_kv_path, exist_ok=True)
-                        metadata_file_path = f"{passage_kv_path}/metadata.json"
-                        with open(metadata_file_path, 'w') as f:
-                            json.dump(metadata, f)
-                        torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
-
-        ""
-
-    ##todo: triton
-    def fix_rope_test(
-        self,
-        forward_batch
-    ):
-        if forward_batch.forward_mode != ForwardMode.EXTEND:
-            return
-        if forward_batch is None or forward_batch.reqs is None:
-            return
-        for req in forward_batch.reqs:
-            if req.hit_chunk_values is not None:
-                for layer_id in range(len(self.layers)):
-                    for hit_chunk_node in req.hit_chunk_values:
-                        device_indices = hit_chunk_node.value
-                        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[device_indices, :, :]
-                        k = k_buffer[:,:,:512]
-                        k_rope = k_buffer[:,:,512:]
-                        layer = self.layers[layer_id]
-                        k_rope = correct_rope_rotation(k_rope,
-                                                       layer.self_attn.rotary_emb.cos_sin_cache,
-                                                       wrong_positions=hit_chunk_node.original_position,
-                                                       correct_positions=hit_chunk_node.current_position)
-                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                            layer.self_attn.attn_mha,
-                            device_indices,
-                            k,
-                            k_rope,
-                        )
-
-    def find_recompute_idx(
-        self,
-        forward_batch
-    ):
-        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                return forward_batch.reqs[0].recompute_idx
-
-
-    def load_kv_cache_to_hbm(
-        self,
-        forward_batch,
-        device,
-        dtype,
-        positions,
-    ) -> torch.Tensor:
-        tp_rank = get_attention_tp_rank()
-        def random_select_1d(lenth: int, percentage: float):
-            num_samples = int(percentage * lenth)
-            indices = torch.randperm(lenth)[:num_samples].sort().values
-            return indices
-
-        kv_cache = []
-        ## starts from the easy case
-        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1: ## only 1 task
-            if forward_batch.forward_mode == ForwardMode.EXTEND: ## this is a generation task, and it's in prefill mode
-                input_text = copy.deepcopy(forward_batch.reqs[0].origin_input_text)
-                load_raw_cache = True
-                if (forward_batch.reqs[0].fusionrag_params is not None
-                    and forward_batch.reqs[0].fusionrag_params.get("load_preprocess_cache", False) is True):
-                    ## load from the preprocess cache
-                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=False)
-                    load_raw_cache = False
-                elif (forward_batch.reqs[0].fusionrag_params is not None
-                    and forward_batch.reqs[0].fusionrag_params.get("load_raw_cache", False) is True):
-                    ## load from raw kv cache
-                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=True)
-                else:
-                    return None
-                found_prefix_chunk = True
-                out_cache_loc_start_idx = 0
-                out_cache_loc_end_idx = 0
-                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get("prefix_prompt", "")
-                recompute_idx = forward_batch.reqs[0].fusionrag_params.get("recompute_idx", [])
-                prefix_prompt_len = len(prefix_prompt)
-                ## 只允许load prefix_prompt_len 长度的prefix
-                while found_prefix_chunk and prefix_prompt_len > 0:
-                    found_prefix_chunk = False
-                    for cache in all_chunk_cache:
-                        chunk_text = cache[0]
-                        kv_cache_pt = cache[1]
-                        cache_prefix_token_len = cache[2]
-                        if input_text.startswith(chunk_text):
-                            found_prefix_chunk = True
-                            chunk_tensor = torch.load(kv_cache_pt, weights_only=True).to(device)
-                            out_cache_loc_end_idx += chunk_tensor.shape[1]
-                            ## fix rope
-                            load_tensor_len = chunk_tensor.shape[1]
-                            prev_pos = torch.arange(cache_prefix_token_len, cache_prefix_token_len+load_tensor_len)
-                            cur_pos = torch.arange(out_cache_loc_start_idx, out_cache_loc_end_idx)
-                            print(f"doing rope from {prev_pos} to {cur_pos}")
-                            for i, layer in enumerate(self.layers):
-                                k, k_rope = chunk_tensor[i].split([512, 64], dim=-1) ## fixme.
-                                if forward_batch.reqs[0].fusionrag_params.get("rope", False) is True:
-                                    k_rope = correct_rope_rotation(k_rope, layer.self_attn.rotary_emb.cos_sin_cache,
-                                                          wrong_positions=prev_pos, correct_positions=cur_pos)
-                                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                                    layer.self_attn.attn_mha,
-                                    forward_batch.out_cache_loc[out_cache_loc_start_idx: out_cache_loc_end_idx],
-                                    k,
-                                    k_rope,
-                                )
-                            if load_raw_cache:
-                                print(f"loaded one RAW cache, text=\n{chunk_text}")
-                            else:
-                                print(f"loaded one PREPROCESS cache, text=\n{chunk_text}")
-                            out_cache_loc_start_idx = out_cache_loc_end_idx
-                            input_text = input_text[len(chunk_text):]
-                            prefix_prompt_len -= len(chunk_text)
-                            break
-                if forward_batch.reqs[0].sampling_params.max_new_tokens > 0:
-                    print(f"load_kv_cache_to_hbm start computing from {out_cache_loc_end_idx}")
-                if len(input_text) == len(forward_batch.reqs[0].origin_input_text):
-                    ## match nothing.
-                    return None
-                ##fixme: only support one input.
-                if out_cache_loc_end_idx == len(forward_batch.reqs[0].origin_input_ids): ## compute at least one.
-                    out_cache_loc_end_idx -= 1
-                sorted_indices = torch.arange(out_cache_loc_end_idx, len(forward_batch.reqs[0].origin_input_ids))
-                if len(recompute_idx) > 0:
-                    recompute_idx_tensor = torch.tensor(recompute_idx)
-                    sorted_indices = torch.cat((sorted_indices, recompute_idx_tensor))
-                    sorted_indices = torch.sort(sorted_indices).values
-                forward_batch.fusion_rag_indices = sorted_indices
-                print(f"recompute_idx = {forward_batch.fusion_rag_indices}")
-                print(f"recompute percentage = {len(recompute_idx)/out_cache_loc_end_idx}")
-                return sorted_indices
-        return None
-
-
-    def list_all_chunk_caches(self, raw_cache: bool):
-        result = []
-        if raw_cache:
-            cache_path = self.cache_path
-        else:
-            cache_path = self.preprocess_cache_path
-        for folder in os.listdir(cache_path):
-            folder_path = os.path.join(cache_path, folder) ## folder is the md5
-            if os.path.isdir(folder_path):
-                metadata_path = os.path.join(folder_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path, 'r', encoding='utf-8') as f:
-                            metadata = json.load(f)
-                        text = metadata.get("text", "")
-                        cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
-                        result.append((text, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len))
-
-                    except (json.JSONDecodeError, KeyError) as e:
-                        print(f"Error reading {metadata_path}: {e}")
-
-        return result
-
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
@@ -3175,7 +2844,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Config not support fused shared expert(s)."
+            disable_reason = "Config does not support fused shared expert(s)."
         elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
@@ -3187,8 +2856,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
+        elif disable_reason is None and (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+        ):
+            disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
@@ -3206,66 +2877,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def get_hidden_dim(self, module_name: str, layer_idx: int):
-        """
-        获取 DeepSeek-V2 MLA 架构中 LoRA 模块的输入和输出维度。
-
-        DeepSeek-V2 使用 MLA (Multi-head Latent Attention)，涉及以下关键投影：
-        - q_proj: 标准查询投影
-        - kv_a_proj_with_mqa: 将 KV 压缩到低维潜空间 (latent space)
-        - kv_b_proj: 从潜空间恢复出 K 和 V
-        - o_proj: 输出投影
-        """
-        config = self.config
-
-        # MLA 特有模块的维度计算
-        if module_name == "q_proj" or module_name == "qkv_proj":
-            # Q 投影（在 LoRA 系统中被重命名为 qkv_proj）：hidden_size -> num_heads * qk_head_dim
-            # 注意：对于 DeepSeek-V2，这里仅包含 Q，而非 QKV
-            qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-            return (
-                config.hidden_size,
-                config.num_attention_heads * qk_head_dim,
-            )
-        elif module_name == "kv_a_proj_with_mqa":
-            # KV 压缩：hidden_size -> kv_lora_rank + qk_rope_head_dim
-            return (
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-            )
-        elif module_name == "kv_b_proj":
-            # KV 解压/扩展：kv_lora_rank -> num_heads * (qk_nope_head_dim + v_head_dim)
-            return (
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-            )
-        elif module_name == "o_proj":
-            # 输出投影：num_heads * v_head_dim -> hidden_size
-            return (
-                config.num_attention_heads * config.v_head_dim,
-                config.hidden_size,
-            )
-        # MLP 模块 (MoE 或共享专家)
-        elif module_name == "gate_up_proj" or module_name == "down_proj":
-            # 根据层结构确定中间层维度 (intermediate_size)
-            # 部分层是普通 MLP，部分层是带有共享专家的 MoE
-            intermediate_size = config.intermediate_size
-
-            # 检查该层是否包含共享专家（使用不同的 intermediate_size）
-            if hasattr(self, "model") and layer_idx < len(self.model.layers):
-                mlp = self.model.layers[layer_idx].mlp
-                # DeepseekV2MoE 具有 shared_experts 属性
-                if hasattr(mlp, "shared_experts"):
-                    # 共享专家使用 moe_intermediate_size * n_shared_experts
-                    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-
-            if module_name == "gate_up_proj":
-                return config.hidden_size, intermediate_size * 2
-            else:  # down_proj
-                return intermediate_size, config.hidden_size
-        else:
-            raise NotImplementedError(f"Module {module_name} not supported for DeepSeek-V2 LoRA")
-
     @torch.no_grad()
     def forward(
         self,
@@ -3275,8 +2886,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # print(f"mengyao_debug input_ids={input_ids.shape}")
-        # print(f"mengyao_debug positions={positions.shape}")
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
@@ -3287,7 +2896,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            ## mengyao_debug
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -3296,7 +2904,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            # print(f"mengyao_debug hidden_states={hidden_states[-1]}")
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
@@ -3357,61 +2964,3 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
-
-def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positions):
-    """
-    修正错误的RoPE旋转
-    q_wrong, k_wrong: 已经用wrong_positions旋转过的张量 [seq_len, num_heads, head_dim]
-    rotary_cache: [max_position, head_dim]，前一半是cos，后一半是sin
-    wrong_positions: 之前错误使用的位置 [5,6,7,8]
-    correct_positions: 正确的位置 [2,3,4,5]
-
-    返回: 修正后的q_correct, k_correct
-    """
-    seq_len, num_heads_k, head_dim = k_wrong.shape
-    half_dim = head_dim // 2
-
-    # 1. 获取错误位置的cos/sin
-    wrong_cache = rotary_cache[wrong_positions]  # [4, 64]
-    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1)  # [4, 1, 32]
-    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1)  # [4, 1, 32]
-
-    # 2. 获取正确位置的cos/sin
-    correct_cache = rotary_cache[correct_positions]  # [4, 64]
-    cos_correct = correct_cache[:, :half_dim].unsqueeze(1)  # [4, 1, 32]
-    sin_correct = correct_cache[:, half_dim:].unsqueeze(1)  # [4, 1, 32]
-
-    # 3. 计算旋转差值的cos/sin
-    # cos(Δθ) = cos(θ_correct - θ_wrong) = cos_correct*cos_wrong + sin_correct*sin_wrong
-    # sin(Δθ) = sin(θ_correct - θ_wrong) = sin_correct*cos_wrong - cos_correct*sin_wrong
-    cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong  # [4, 1, 32]
-    sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong  # [4, 1, 32]
-
-    # 4. 将q_wrong/k_wrong重塑为[..., 32, 2]
-    k_reshaped = k_wrong.view(seq_len, num_heads_k, half_dim, 2)
-
-    # 5. 分离偶数和奇数维度
-    k_even = k_reshaped[..., 0]
-    k_odd = k_reshaped[..., 1]
-
-    # 6. 应用修正旋转：用Δθ旋转当前向量
-    # x_correct = x_wrong * cos(Δθ) - y_wrong * sin(Δθ)
-    # y_correct = x_wrong * sin(Δθ) + y_wrong * cos(Δθ)
-
-    k_correct_even = k_even * cos_delta - k_odd * sin_delta
-    k_correct_odd = k_even * sin_delta + k_odd * cos_delta
-
-    # 7. 重新组合
-    k_correct = torch.stack([k_correct_even, k_correct_odd], dim=-1)
-
-    return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
-
-
-def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
-    return False
-    if os.environ.get("DEBUG", "0") == "0":
-        return True
-    if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            return True
-    return False
