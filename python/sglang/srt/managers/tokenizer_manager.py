@@ -702,6 +702,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     prefix_prompt_ids_ = []
                 recompute_idx.extend(range(len(prefix_prompt_ids), len(prefix_prompt_ids_)))
             cur_texts = cur_texts_
+        recompute_idx = sorted(set(recompute_idx))
+        if len(recompute_idx) != len(set(recompute_idx)):
+            print(f"mengyao_debug recompute_idx={recompute_idx} HAS DUPLICATES!")
         return recompute_idx
 
 
