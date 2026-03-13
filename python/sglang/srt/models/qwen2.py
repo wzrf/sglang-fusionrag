@@ -195,9 +195,39 @@ class Qwen2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        save_kv_cache = True
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            save_kv_cache = False
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer=self.attn,
+                loc=forward_batch.out_cache_loc,
+                cache_k=k,
+                cache_v=v,
+            )
+            kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+            k_ = k_[kv_indices]
+            v_ = v_[kv_indices]
+            k = k_.flatten(start_dim=-2).contiguous()
+            v = v_.flatten(start_dim=-2).contiguous()
+
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+    # def forward(
+    #     self,
+    #     positions: torch.Tensor,
+    #     hidden_states: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    # ) -> torch.Tensor:
+    #     qkv, _ = self.qkv_proj(hidden_states)
+    #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    #     q, k = self.rotary_emb(positions, q, k)
+    #     attn_output = self.attn(q, k, v, forward_batch)
+    #     output, _ = self.o_proj(attn_output)
+    #     return output
 
 
 class Qwen2DecoderLayer(nn.Module):

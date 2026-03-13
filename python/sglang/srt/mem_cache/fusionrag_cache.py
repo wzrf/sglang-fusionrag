@@ -233,7 +233,7 @@ class FusionragCache(RadixCache):
         self.preprocess_cache_path = f"/mnt/data3/shm/fusionrag_tree_cache/DeepSeek-v3.2/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
             self.cache_path = f"/mnt/data3/shm/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3shm/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
+            self.preprocess_cache_path = f"/mnt/data3/shm/fusionrag_tree_cache_DEBUG/DeepSeek-v3.2/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
