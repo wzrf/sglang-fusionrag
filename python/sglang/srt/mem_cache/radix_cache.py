@@ -68,8 +68,7 @@ class RadixKey:
         origin_input_text: Optional[str] = None,
         prefix_prompt_text: Optional[str] = None,
         is_kv_gen: bool = False,
-        is_preprocess_kv_gen: bool = False,
-        use_preprocess_kv_cache: bool = False,
+        kv_type: Optional[str] = None,
     ):
         # token ids sequence
         self.token_ids = token_ids
@@ -80,8 +79,7 @@ class RadixKey:
         self.origin_input_text = origin_input_text
         self.prefix_prompt_text = prefix_prompt_text
         self.is_kv_gen = is_kv_gen
-        self.is_preprocess_kv_gen = is_preprocess_kv_gen ## 生成 preprocess kv cache
-        self.use_preprocess_kv_cache = use_preprocess_kv_cache ## 使用 preprocess kv cache
+        self.kv_type = kv_type
     def __len__(self) -> int:
         return len(self.token_ids)
 

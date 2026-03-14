@@ -19,6 +19,7 @@ import dataclasses
 import logging
 import os
 import pickle
+import re
 import signal
 import socket
 import sys
@@ -744,10 +745,51 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 input_text, is_cross_encoder_request
             )
             if obj.fusionrag_params is not None:
+                deprecated_keys = [
+                    "save_preprocess_cache",
+                    "load_preprocess_cache",
+                    "save_raw_cache",
+                    "load_raw_cache",
+                ]
+                used_deprecated = [
+                    k for k in deprecated_keys if k in obj.fusionrag_params
+                ]
+                if len(used_deprecated) > 0:
+                    raise ValueError(
+                        "Invalid fusionrag_params: deprecated keys are not supported "
+                        f"{used_deprecated}. Please use kv_type only."
+                    )
+
+                kv_type = obj.fusionrag_params.get("kv_type", None)
+                if kv_type is None:
+                    raise ValueError(
+                        "Invalid fusionrag_params: kv_type is required."
+                    )
+                kv_type = str(kv_type).strip()
+                if len(kv_type) == 0:
+                    raise ValueError(
+                        "Invalid fusionrag_params.kv_type: it cannot be empty."
+                    )
+                if re.fullmatch(r"[A-Za-z0-9._-]+", kv_type) is None:
+                    raise ValueError(
+                        "Invalid fusionrag_params.kv_type: only [A-Za-z0-9._-] are allowed."
+                    )
+                obj.fusionrag_params["kv_type"] = kv_type
+
                 prefix_prompt_ids = []
                 prefix_prompt = ""
                 if "prefix_prompt" in obj.fusionrag_params:
                     prefix_prompt = obj.fusionrag_params["prefix_prompt"]
+                    if (
+                        obj.fusionrag_params.get("save_cache", False)
+                        and isinstance(input_text, str)
+                        and len(prefix_prompt) > 0
+                        and not input_text.startswith(prefix_prompt)
+                    ):
+                        raise ValueError(
+                            "Invalid fusionrag_params: prompt must start with "
+                            "fusionrag_params.prefix_prompt when save_cache=True."
+                        )
                     if len(obj.fusionrag_params["prefix_prompt"]) > 0:
                         prefix_prompt_ids, _ = await self._tokenize_texts(
                             obj.fusionrag_params["prefix_prompt"], is_cross_encoder_request
