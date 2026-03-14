@@ -555,24 +555,20 @@ class Req:
         self.all_compute_idx: List[int] = []
 
         if fusionrag_params is not None:
-            logger.error(
-                "检查环节：fusionrag_params received in Req: "
-                f"save_cache={fusionrag_params.get('save_cache', False)} "
-                f"save_raw_cache={fusionrag_params.get('save_raw_cache', False)} "
-                f"save_preprocess_cache={fusionrag_params.get('save_preprocess_cache', False)} "
-                f"keys={list(fusionrag_params.keys())}"
-            )
+            ## 1. is_kv_gen=True, save_preprocess_cache=False, 直接查看raw cache里是否存在
+            ## 2. is_kv_gen=True, save_preprocess_cache=True, 和raw_cache decode请求一样，去raw cache 匹配
+            ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
+            ## 3. is_kv_gen=False, load_preprocess_cache=True, 去preprocess cache 匹配
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
-            self.save_preprocess_cache = fusionrag_params.get(
-                "save_preprocess_cache", False
-            )
+            self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
-            self.save_raw_cache = fusionrag_params.get("save_raw_cache", False)
-            if not self.save_raw_cache and not self.save_preprocess_cache:
-                # Default to raw cache when save_cache is requested without explicit flags.
-                self.save_raw_cache = self.is_kv_gen
+            self.save_raw_cache = not self.save_preprocess_cache
+            self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
+            #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
+            if self.is_kv_gen and self.save_preprocess_cache:
+                self.use_preprocess_cache = False
             fusionrag_params = None
         else:
             self.is_kv_gen = False
@@ -580,6 +576,7 @@ class Req:
             self.prefix_prompt = ""
             self.save_preprocess_cache = False
             self.save_raw_cache = False
+            self.use_preprocess_cache = False
             self.recompute_idx = []
         # shm debug
         # self.is_kv_gen = True
@@ -918,7 +915,10 @@ class Req:
                                  extra_key=self.extra_key,
                                  origin_input_text=self.origin_input_text,
                                  prefix_prompt_text=self.prefix_prompt,
-                                 is_kv_gen=self.is_kv_gen),
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache
+                                 ),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
                 )

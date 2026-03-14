@@ -80,6 +80,7 @@ class ChunkNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        self.is_preprocess_cache = False ## false is raw cache, true is preprocess cache
 
         self.id = ChunkNode.counter if id is None else id
         ChunkNode.counter += 1
@@ -241,12 +242,12 @@ class FusionragCache(RadixCache):
         super().__init__(params=params)
         self.load_all_from_ssd()
 
-    def list_all_chunk_caches(self, raw_cache: bool):
+    def list_all_chunk_caches(self, use_preprocess_cache: bool):
         result = []
-        if raw_cache:
-            cache_path = self.cache_path
-        else:
+        if use_preprocess_cache:
             cache_path = self.preprocess_cache_path
+        else:
+            cache_path = self.cache_path
         for folder in os.listdir(cache_path):
             folder_path = os.path.join(cache_path, folder) ## folder is the md5
             if os.path.isdir(folder_path):
@@ -258,7 +259,13 @@ class FusionragCache(RadixCache):
                         text_without_prefix = metadata.get("text", "")
                         cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
                         prefix_text = metadata.get("prefix_text", "")
-                        result.append((text_without_prefix, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len, prefix_text))
+                        result.append(
+                            (text_without_prefix,
+                             os.path.join(folder_path, f"{folder}.pt"),
+                             cache_prefix_token_len,
+                             prefix_text,
+                             use_preprocess_cache)
+                        )
 
                     except (json.JSONDecodeError, KeyError) as e:
                         print(f"Error reading {metadata_path}: {e}")
@@ -266,11 +273,17 @@ class FusionragCache(RadixCache):
         return result
 
     def load_all_from_ssd(self):
-        for all_chunk_caches in self.list_all_chunk_caches(raw_cache=True):
-            text_without_prefix = all_chunk_caches[0]
-            tensor_path = all_chunk_caches[1]
-            cache_prefix_token_len = all_chunk_caches[2]
-            prefix_text = all_chunk_caches[3]
+        raw_chunk_caches = self.list_all_chunk_caches(use_preprocess_cache=False)
+        preprocess_chunk_caches = self.list_all_chunk_caches(use_preprocess_cache=True)
+        all_chunk_caches = []
+        all_chunk_caches.extend(raw_chunk_caches)
+        all_chunk_caches.extend(preprocess_chunk_caches)
+        for all_chunk_cache in all_chunk_caches:
+            text_without_prefix = all_chunk_cache[0]
+            tensor_path = all_chunk_cache[1]
+            cache_prefix_token_len = all_chunk_cache[2]
+            prefix_text = all_chunk_cache[3]
+            is_preprocess_cache = all_chunk_cache[4]
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[1]
             try:
@@ -288,6 +301,7 @@ class FusionragCache(RadixCache):
                 node.text_without_prefix = text_without_prefix
                 node.prefix_text = prefix_text
                 node.cache_prefix_token_len = cache_prefix_token_len
+                node.is_preprocess_cache = is_preprocess_cache
                 node.host_value = host_indices
                 node.values = []
                 self.all_nodes.append(node)
@@ -557,40 +571,44 @@ class FusionragCache(RadixCache):
         all_hit_chunk_nodes = []
         host_hit_length = 0
         if params.key.is_kv_gen:
-            # if it's to gen kv, we check if the origin_input_text has already been generated.
-            input_text = str(copy.deepcopy(params.key.origin_input_text))
+            for node in self.all_nodes:
+                if node.is_preprocess_cache == params.key.is_preprocess_kv_gen:
+                    prefix_text = params.key.prefix_prompt_text
+                    text_without_prefix = params.key.origin_input_text[len(prefix_text):]
+                    if text_without_prefix == node.text_without_prefix:
+                        print(f"kv gen already run before\ntext={text_without_prefix}\n"
+                              f"prefix={prefix_text}\n"
+                              f"is_preprocess_cache={node.is_preprocess_cache}")
+                        return MatchResult(
+                            device_indices=torch.empty(
+                                (0,),
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),  ## mengyao_debug let all be empty on the device.
+                            all_hit_chunk_nodes=all_hit_chunk_nodes,
+                            host_hit_length=host_hit_length,
+                            last_host_node=None,
+                            last_device_node=None,
+                            no_need_to_run=True,
+                        )
+
+        if params.key.is_kv_gen and params.key.is_preprocess_kv_gen is False:
+            # 如果是kv gen并且不是存储preprocess的话，不用匹配，直接生成
+            input_text = ""
         else:
-            # if it's a decoding task, we match prefix in prefix_prompt_text
+            # 如果是decode或者是preprocess的话，匹配前缀
             input_text = str(copy.deepcopy(params.key.prefix_prompt_text))
         last_round_found = True
         if len(input_text) == 0:
             print(f"mengyao_debug fusionrag cache match_prefix skipping prefix.")
-        if params.key.is_kv_gen:
-            ## 如果是kv gen，只match一次
+        ##
+        while len(input_text) > 0 and last_round_found:
+            last_round_found = False
             for node in self.all_nodes:
-                prefix_text = params.key.prefix_prompt_text
-                text_without_prefix = params.key.origin_input_text[len(prefix_text):]
-                if text_without_prefix == node.text_without_prefix and prefix_text == node.prefix_text:
-                    print(f"kv gen already run before\ntext={text_without_prefix}\nprefix={prefix_text}")
-                    return MatchResult(
-                        device_indices=torch.empty(
-                            (0,),
-                            dtype=torch.int64,
-                            device=self.device,
-                        ),  ## mengyao_debug let all be empty on the device.
-                        all_hit_chunk_nodes=all_hit_chunk_nodes,
-                        host_hit_length=host_hit_length,
-                        last_host_node=None,
-                        last_device_node=None,
-                        no_need_to_run=True,
-                    )
-
-        else:
-            while len(input_text) > 0 and last_round_found:
-                last_round_found = False
-                for node in self.all_nodes:
+                ## 找到和preprocess/raw 匹配的nodes
+                if node.is_preprocess_cache == params.key.use_preprocess_kv_cache:
                     if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
-                        print(f"load text: {node.text_without_prefix[:20]}")
+                        print(f"load text: {node.text_without_prefix[:20]}, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
                         input_text = input_text[len(node.text_without_prefix) :]
@@ -617,14 +635,17 @@ class FusionragCache(RadixCache):
         priority: int | None = None,
         is_kv_gen: bool = False,
         kv_gen_prefix_len: int = 0,
+        is_preprocess_cache: bool = False,
     ):
         if is_kv_gen:
             node = ChunkNode()
+            ## 不存储prefix部分
             node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
             node.prefix_text = key.prefix_prompt_text
             node.values = [value]
             node.priority = priority
             node.cache_prefix_token_len = kv_gen_prefix_len
+            node.is_preprocess_cache = is_preprocess_cache
             target_len = len(node.text_without_prefix)
             pos = bisect.bisect_left(
                 self.all_nodes,
@@ -708,11 +729,13 @@ class FusionragCache(RadixCache):
             values = kv_indices.to(dtype=torch.int64, copy=True)
             self.insert(
                 radix_key,
-                values[req.kv_gen_prefix_len:],
+                values[req.kv_gen_prefix_len:], ## 不存储prefix部分
                 priority=0,
                 is_kv_gen=True,
-                kv_gen_prefix_len=req.kv_gen_prefix_len)
-            self._write_cache_to_disk(req, kv_indices)
+                kv_gen_prefix_len=req.kv_gen_prefix_len,
+                is_preprocess_cache=req.save_preprocess_cache
+            )
+            self._write_cache_to_disk(req, kv_indices) ## 不存储prefix部分
 
         ## either case 都要把显存清理掉，要把output_ids部分也清理掉
         kv_committed_len = req.pop_committed_kv_cache()
@@ -737,7 +760,7 @@ class FusionragCache(RadixCache):
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor) -> None:
         kv_cache = []
-        kv_indices = kv_indices_[req.kv_gen_prefix_len:]
+        kv_indices = kv_indices_[req.kv_gen_prefix_len:] ## 不存储prefix部分
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices].to('cpu')
             kv_cache.append(k_buffer)
