@@ -278,11 +278,19 @@ class DeepseekMHAForwardMixin:
                 # BF16/FP16 path: directly fetch from cache
                 kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
                 if self.layer_id == 0:
-                    print(f"mengyao_debug kv_indice={kv_indices}")
+                    print(f"mengyao_debug kv_indice={kv_indices}, shape={kv_indices.shape}")
+                    torch.set_printoptions(threshold=10000)
+                    print(f"mengyao_debug out_cache_loc={forward_batch.out_cache_loc}, shape={forward_batch.out_cache_loc.shape}")
+                    torch.set_printoptions(threshold=1000)
                     if has_duplicates(kv_indices):
                         torch.set_printoptions(threshold=10000)
                         print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, "
                               f"req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
+                        torch.set_printoptions(threshold=1000)
+                        raise "HAS DUPLICATES"
+                    if has_duplicates(forward_batch.out_cache_loc):
+                        torch.set_printoptions(threshold=10000)
+                        print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
                         torch.set_printoptions(threshold=1000)
                         raise "HAS DUPLICATES"
                 kv_a, k_pe = self._get_mla_kv_buffer(
