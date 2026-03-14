@@ -6,6 +6,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
 import heapq
+import bisect
 import torch
 import os, copy
 from typing import Any
@@ -292,6 +293,9 @@ class FusionragCache(RadixCache):
                 self.all_nodes.append(node)
             except Exception as e:
                 print(f"unsupport layout detected.")
+
+        ## sort.
+        self.all_nodes.sort(key=lambda n: len(n.text_without_prefix), reverse=True)
 
 
     def _parse_storage_backend_extra_config(
@@ -585,7 +589,7 @@ class FusionragCache(RadixCache):
             while len(input_text) > 0 and last_round_found:
                 last_round_found = False
                 for node in self.all_nodes:
-                    if input_text.startswith(node.text_without_prefix):
+                    if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
                         print(f"load text: {node.text_without_prefix[:20]}")
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
@@ -621,7 +625,13 @@ class FusionragCache(RadixCache):
             node.values = [value]
             node.priority = priority
             node.cache_prefix_token_len = kv_gen_prefix_len
-            self.all_nodes.append(node)
+            target_len = len(node.text_without_prefix)
+            pos = bisect.bisect_left(
+                self.all_nodes,
+                -target_len,
+                key=lambda n: -len(n.text_without_prefix)
+            )
+            self.all_nodes.insert(pos, node)
             ## 把数据写回主存里
             self.write_backup(node)
             ## 不留显存
@@ -744,9 +754,8 @@ class FusionragCache(RadixCache):
                   f"prefix=\n{prefix_prompt}")
         elif req.save_raw_cache is True:
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
-            print(f"mengyao_debug save to RAW cache\n"
-                  f"text=\n{text[len(prefix_prompt):][:20]}\n"
-                  f"prefix=\n{prefix_prompt}")
+            print(f"mengyao_debug save to RAW cache text={text[len(prefix_prompt):][:20]} "
+                  f"prefix={prefix_prompt}")
         else:
             raise "either save_preprocess_cache or save_raw_cache must be True"
         os.makedirs(passage_kv_path, exist_ok=True)
