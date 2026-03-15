@@ -1543,11 +1543,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a KV GEN TASK")
             else:
                 print(f"mengyao_debug This is a DECODER TASK")
+
             if len(r.prefix_indices) >0:
                 print(f"mengyao_debug recompute percentage="
                       f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
             else:
                 print(f"mengyao_debug compute percentage=100%")
+                
             # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")
             # print(f"r.fill_ids = {len(r.fill_ids)}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
