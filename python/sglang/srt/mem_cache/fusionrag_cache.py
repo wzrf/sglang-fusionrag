@@ -402,7 +402,7 @@ class FusionragCache(RadixCache):
             node_id=node.id,
         )
         if host_indices is None:
-            self.evict_host(len(node.value))
+            self.evict_host(len(node.values))
             host_indices = self.cache_controller.write(
                 device_indices=node.values[0],
                 node_id=node.id,
