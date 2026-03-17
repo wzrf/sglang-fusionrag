@@ -232,11 +232,11 @@ class FusionragCache(RadixCache):
         served_model_name = server_args.served_model_name
         # if not os.path.exists(cache_path_root):
         #     cache_path_root = "/mnt/data"
-        self.cache_path = f"/mnt/data3/shm/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"/mnt/data3/shm/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+        self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
+        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"/mnt/data3/shm/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3/shm/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
+            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -286,9 +286,9 @@ class FusionragCache(RadixCache):
             prefix_text = all_chunk_cache[3]
             is_preprocess_cache = all_chunk_cache[4]
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
-            prefetch_length = chunk_tensor.shape[1]
+            prefetch_length = chunk_tensor.shape[2]
             try:
-                if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[0]:
+                if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[1]:
                     print(f"shape mismatch.")
                     continue
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -307,7 +307,7 @@ class FusionragCache(RadixCache):
                 node.values = []
                 self.all_nodes.append(node)
             except Exception as e:
-                print(f"unsupport layout detected.")
+                print(f"unsupport layout detected. e={e}, preprocess_chunk_caches={preprocess_chunk_caches}")
 
         ## sort.
         self.all_nodes.sort(key=lambda n: len(n.text_without_prefix), reverse=True)
@@ -728,15 +728,19 @@ class FusionragCache(RadixCache):
                 prefix_prompt_text=req.prefix_prompt,
             )
             values = kv_indices.to(dtype=torch.int64, copy=True)
+            if req.save_preprocess_cache:
+                kv_prefix_len = req.host_hit_length ## 如果是preprocess，那么要存储hit host的length，因为长度和prefix_len会有区别
+            else:
+                kv_prefix_len = req.kv_gen_prefix_len ## 如果是 raw，那么存储prefix len，因为不会hit
             self.insert(
                 radix_key,
-                values[req.kv_gen_prefix_len:], ## 不存储prefix部分
+                values[kv_prefix_len:], ## 不存储prefix部分
                 priority=0,
                 is_kv_gen=True,
-                kv_gen_prefix_len=req.kv_gen_prefix_len,
+                kv_gen_prefix_len=kv_prefix_len,
                 is_preprocess_cache=req.save_preprocess_cache
             )
-            self._write_cache_to_disk(req, kv_indices) ## 不存储prefix部分
+            self._write_cache_to_disk(req, kv_indices, kv_prefix_len) ## 不存储prefix部分
 
         ## either case 都要把显存清理掉，要把output_ids部分也清理掉
         kv_committed_len = req.pop_committed_kv_cache()
@@ -759,16 +763,21 @@ class FusionragCache(RadixCache):
 
         self.req_to_token_pool.free(req.req_pool_idx)
 
-    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor) -> None:
-        kv_cache = []
-        kv_indices = kv_indices_[req.kv_gen_prefix_len:] ## 不存储prefix部分
+    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int) -> None:
+        k_cache = []
+        v_cache = []
+        kv_indices = kv_indices_[kv_prefix_len:] ## 不存储prefix部分
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices].to('cpu')
-            kv_cache.append(k_buffer)
-        kv_cache = torch.stack(kv_cache, dim=0)
+            v_buffer = self.kv_cache.get_value_buffer(layer_id)[kv_indices].to('cpu')
+            k_cache.append(k_buffer)
+            v_cache.append(v_buffer)
+        k_caches = torch.stack(k_cache, dim=0)
+        v_caches = torch.stack(v_cache, dim=0)
+        kv_cache = torch.stack([k_caches, v_caches], dim=0)
         text = req.origin_input_text
         prefix_prompt = req.prefix_prompt
-        cache_prefix_token_len = req.kv_gen_prefix_len
+        cache_prefix_token_len = kv_prefix_len
         metadata = {
             "text": text[len(prefix_prompt):],  ## only save the document itself.
             "cache_prefix_token_len": cache_prefix_token_len,

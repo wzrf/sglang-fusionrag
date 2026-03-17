@@ -194,7 +194,7 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k) ## [len, 512]
         save_kv_cache = True
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             save_kv_cache = False
@@ -382,8 +382,8 @@ class Qwen2Model(nn.Module):
                 f"/mnt/data3/shm/fusionrag/{model_name}_tp_{tp_size_}/preprocess_kv_cache"
             )
 
-        os.makedirs(self.cache_path, exist_ok=True)
-        os.makedirs(self.preprocess_cache_path, exist_ok=True)
+        # os.makedirs(self.cache_path, exist_ok=True)
+        # os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -403,6 +403,7 @@ class Qwen2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
+        # self.fix_rope_test(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -415,21 +416,6 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        # if self.check_if_cache_calculated_before(forward_batch):
-        #     return hidden_states
-
-        # origin_positions = None
-        # new_positions = self.load_kv_cache_to_hbm(
-        #     forward_batch=forward_batch,
-        #     dtype=hidden_states.dtype,
-        #     device=hidden_states.device,
-        #     positions=positions,
-        # )
-        # if new_positions is not None:
-        #     origin_positions = copy.deepcopy(positions)
-        #     positions = new_positions.to(positions.device)
-        #     hidden_states = hidden_states[positions]
-
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
@@ -456,11 +442,6 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        # self.save_kv_cache_to_disk(
-        #     forward_batch,
-        #     dtype=hidden_states.dtype,
-        #     positions=positions,
-        # )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -490,312 +471,34 @@ class Qwen2Model(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
-    def check_if_cache_calculated_before(self, forward_batch):
-        if forward_batch.reqs is not None and len(forward_batch.reqs) == 1:  ## only 1 task
-            if (
-                forward_batch.forward_mode == ForwardMode.EXTEND
-                and forward_batch.reqs[0].fusionrag_params is not None
-                and forward_batch.reqs[0].fusionrag_params.get("save_cache", False)
-                is True
-            ):  ## only happens when compute and save cache.
-                text = forward_batch.reqs[0].origin_input_text
-                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get(
-                    "prefix_prompt", ""
-                )
-                if (
-                    forward_batch.reqs[0].fusionrag_params.get(
-                        "save_preprocess_cache", False
-                    )
-                    is True
-                ):
-                    raw_cache = False
-                else:
-                    raw_cache = True
-                all_chunk_cache = self.list_all_chunk_caches(raw_cache=raw_cache)
-                all_texts = [cache[0] for cache in all_chunk_cache]
-                if text[len(prefix_prompt) :] in all_texts:
-                    if raw_cache:
-                        print(
-                            "[check_if_cache_calculated_before] RAW cache: text=\n"
-                            f"{text[len(prefix_prompt):]}\n"
-                            f"prefix=\n{prefix_prompt}\n"
-                        )
-                    else:
-                        print(
-                            "[check_if_cache_calculated_before] PREPROCESS cache: text=\n"
-                            f"{text[len(prefix_prompt):]}\n"
-                            f"prefix=\n{prefix_prompt}\n"
-                        )
-                    return True
-        return False
-
-    def save_kv_cache_to_disk(
+    def fix_rope_test(
         self,
-        forward_batch,
-        dtype,
-        positions,
+        forward_batch
     ):
-        _ = get_attention_tp_rank()
-        if (
-            forward_batch.forward_mode == ForwardMode.EXTEND
-        ):  ## only do this in prefill mode
-            if forward_batch.extend_seq_lens_cpu is not None:
-                for i, text_len in enumerate(forward_batch.extend_seq_lens_cpu):
-                    k_cache = []
-                    v_cache = []
-                    text = forward_batch.reqs[i].origin_input_text
-                    if (
-                        forward_batch.reqs[i].fusionrag_params is not None
-                        and forward_batch.reqs[i].fusionrag_params.get(
-                            "save_cache", False
-                        )
-                        is True
-                    ):
-                        cache_start_idx = sum(forward_batch.extend_seq_lens_cpu[:i])
-                        cache_end_idx = sum(
-                            forward_batch.extend_seq_lens_cpu[: i + 1]
-                        )
-                        cache_prefix_token_len = len(
-                            forward_batch.reqs[i].fusionrag_params["prefix_prompt_ids"]
-                        )
-                        prefix_prompt = forward_batch.reqs[i].fusionrag_params.get(
-                            "prefix_prompt", ""
-                        )
-                        locs = forward_batch.out_cache_loc[
-                            cache_start_idx + cache_prefix_token_len : cache_end_idx
-                        ]
-                        for layer_id in range(len(self.layers)):
-                            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(
-                                layer_id
-                            ).to(dtype)[locs, :, :].to("cpu")
-                            v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
-                                layer_id
-                            ).to(dtype)[locs, :, :].to("cpu")
-                            k_cache.append(k_buffer)
-                            v_cache.append(v_buffer)
-                        kv_cache = {
-                            "k": torch.stack(k_cache, dim=0),
-                            "v": torch.stack(v_cache, dim=0),
-                        }
-                        if not text.startswith(prefix_prompt):
-                            print(
-                                "mengyao_debug not start with prefix!\n"
-                                f"prefix={forward_batch.reqs[i].fusionrag_params['prefix_prompt']}\n"
-                                f"text={text}"
-                            )
-                        metadata = {
-                            "text": text[len(prefix_prompt) :],  ## only save the document itself.
-                            "cache_prefix_token_len": cache_prefix_token_len,
-                            "prefix_text": prefix_prompt,
-                        }
-                        md5_hash = hashlib.md5(
-                            text[len(prefix_prompt) :].encode("utf-8")
-                        ).hexdigest()
-                        if (
-                            forward_batch.reqs[i].fusionrag_params.get(
-                                "save_preprocess_cache", False
-                            )
-                            is True
-                        ):
-                            passage_kv_path = (
-                                f"{self.preprocess_cache_path}/{md5_hash}"
-                            )
-                            print(
-                                "mengyao_debug save to PREPROCESS cache\n"
-                                f"text=\n{text[len(prefix_prompt):]}\n"
-                                f"prefix=\n{prefix_prompt}"
-                            )
-                        else:
-                            passage_kv_path = f"{self.cache_path}/{md5_hash}"
-                            print(
-                                "mengyao_debug save to RAW cache\n"
-                                f"text=\n{text[len(prefix_prompt):]}\n"
-                                f"prefix=\n{prefix_prompt}"
-                            )
-                        os.makedirs(passage_kv_path, exist_ok=True)
-                        metadata_file_path = f"{passage_kv_path}/metadata.json"
-                        with open(metadata_file_path, "w") as f:
-                            json.dump(metadata, f)
-                        torch.save(kv_cache, f"{passage_kv_path}/{md5_hash}.pt")
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        for req in forward_batch.reqs:
+            if req.hit_chunk_values is not None:
+                for layer_id, layer in enumerate(self.layers):
+                    for hit_chunk_node in req.hit_chunk_values:
+                        device_indices = hit_chunk_node.value
+                        k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                        k = k_[device_indices]
+                        v = v_[device_indices]
 
-    def load_kv_cache_to_hbm(
-        self,
-        forward_batch,
-        device,
-        dtype,
-        positions,
-    ) -> torch.Tensor:
-        tp_rank = get_attention_tp_rank()
-
-        kv_cache = []
-        ## starts from the easy case
-        if (
-            forward_batch.reqs is not None and len(forward_batch.reqs) == 1
-        ):  ## only 1 task
-            if (
-                forward_batch.forward_mode == ForwardMode.EXTEND
-            ):  ## this is a generation task, and it's in prefill mode
-                input_text = copy.deepcopy(forward_batch.reqs[0].origin_input_text)
-                load_raw_cache = True
-                if (
-                    forward_batch.reqs[0].fusionrag_params is not None
-                    and forward_batch.reqs[0].fusionrag_params.get(
-                        "load_preprocess_cache", False
-                    )
-                    is True
-                ):
-                    ## load from the preprocess cache
-                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=False)
-                    load_raw_cache = False
-                elif (
-                    forward_batch.reqs[0].fusionrag_params is not None
-                    and forward_batch.reqs[0].fusionrag_params.get(
-                        "load_raw_cache", False
-                    )
-                    is True
-                ):
-                    ## load from raw kv cache
-                    all_chunk_cache = self.list_all_chunk_caches(raw_cache=True)
-                else:
-                    return None
-                found_prefix_chunk = True
-                out_cache_loc_start_idx = 0
-                out_cache_loc_end_idx = 0
-                prefix_prompt = forward_batch.reqs[0].fusionrag_params.get(
-                    "prefix_prompt", ""
-                )
-                recompute_idx = forward_batch.reqs[0].fusionrag_params.get(
-                    "recompute_idx", []
-                )
-                prefix_prompt_len = len(prefix_prompt)
-                ## 只允许load prefix_prompt_len 长度的prefix
-                while found_prefix_chunk and prefix_prompt_len > 0:
-                    found_prefix_chunk = False
-                    for cache in all_chunk_cache:
-                        chunk_text = cache[0]
-                        kv_cache_pt = cache[1]
-                        cache_prefix_token_len = cache[2]
-                        if input_text.startswith(chunk_text):
-                            found_prefix_chunk = True
-                            chunk_tensor = torch.load(kv_cache_pt, weights_only=True)
-                            if isinstance(chunk_tensor, dict):
-                                k_chunk = chunk_tensor["k"].to(device)
-                                v_chunk = chunk_tensor["v"].to(device)
-                            elif (
-                                isinstance(chunk_tensor, (list, tuple))
-                                and len(chunk_tensor) == 2
-                            ):
-                                k_chunk = chunk_tensor[0].to(device)
-                                v_chunk = chunk_tensor[1].to(device)
-                            else:
-                                raise ValueError(
-                                    "Unexpected kv cache format. Expect dict with "
-                                    "'k'/'v' or a (k, v) tuple."
-                                )
-                            out_cache_loc_end_idx += k_chunk.shape[1]
-                            ## fix rope
-                            load_tensor_len = k_chunk.shape[1]
-                            prev_pos = torch.arange(
-                                cache_prefix_token_len,
-                                cache_prefix_token_len + load_tensor_len,
-                                device=device,
-                            )
-                            cur_pos = torch.arange(
-                                out_cache_loc_start_idx,
-                                out_cache_loc_end_idx,
-                                device=device,
-                            )
-                            print(f"doing rope from {prev_pos} to {cur_pos}")
-                            for i, layer in enumerate(self.layers):
-                                k = k_chunk[i]
-                                v = v_chunk[i]
-                                if (
-                                    forward_batch.reqs[0].fusionrag_params.get(
-                                        "rope", False
-                                    )
-                                    is True
-                                ):
-                                    k = correct_rope_rotation(
-                                        k,
-                                        layer.self_attn.rotary_emb.cos_sin_cache,
-                                        wrong_positions=prev_pos,
-                                        correct_positions=cur_pos,
-                                    )
-                                forward_batch.token_to_kv_pool.set_kv_buffer(
-                                    layer.self_attn.attn,
-                                    forward_batch.out_cache_loc[
-                                        out_cache_loc_start_idx:out_cache_loc_end_idx
-                                    ],
-                                    k,
-                                    v,
-                                )
-                            if load_raw_cache:
-                                print(f"loaded one RAW cache, text=\n{chunk_text}")
-                            else:
-                                print(
-                                    f"loaded one PREPROCESS cache, text=\n{chunk_text}"
-                                )
-                            out_cache_loc_start_idx = out_cache_loc_end_idx
-                            input_text = input_text[len(chunk_text) :]
-                            prefix_prompt_len -= len(chunk_text)
-                            break
-                if forward_batch.reqs[0].sampling_params.max_new_tokens > 0:
-                    print(
-                        "load_kv_cache_to_hbm start computing from "
-                        f"{out_cache_loc_end_idx}"
-                    )
-                if len(input_text) == len(forward_batch.reqs[0].origin_input_text):
-                    ## match nothing.
-                    return None
-                ##fixme: only support one input.
-                if out_cache_loc_end_idx == len(
-                    forward_batch.reqs[0].origin_input_ids
-                ):  ## compute at least one.
-                    out_cache_loc_end_idx -= 1
-                sorted_indices = torch.arange(
-                    out_cache_loc_end_idx,
-                    len(forward_batch.reqs[0].origin_input_ids),
-                )
-                if len(recompute_idx) > 0:
-                    recompute_idx_tensor = torch.tensor(recompute_idx)
-                    sorted_indices = torch.cat(
-                        (sorted_indices, recompute_idx_tensor)
-                    )
-                    sorted_indices = torch.sort(sorted_indices).values
-                forward_batch.fusion_rag_indices = sorted_indices
-                print(f"recompute_idx = {forward_batch.fusion_rag_indices}")
-                print(
-                    f"recompute percentage = {len(recompute_idx)/out_cache_loc_end_idx}"
-                )
-                return sorted_indices
-        return None
-
-    def list_all_chunk_caches(self, raw_cache: bool):
-        result = []
-        if raw_cache:
-            cache_path = self.cache_path
-        else:
-            cache_path = self.preprocess_cache_path
-        for folder in os.listdir(cache_path):
-            folder_path = os.path.join(cache_path, folder)  ## folder is the md5
-            if os.path.isdir(folder_path):
-                metadata_path = os.path.join(folder_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path, "r", encoding="utf-8") as f:
-                            metadata = json.load(f)
-                        text = metadata.get("text", "")
-                        cache_prefix_token_len = metadata.get(
-                            "cache_prefix_token_len", ""
-                        )
-                        result.append(
-                            (text, os.path.join(folder_path, f"{folder}.pt"), cache_prefix_token_len)
+                        k_rope = correct_rope_rotation(k,
+                                                       layer.self_attn.rotary_emb.cos_sin_cache,
+                                                       wrong_positions=hit_chunk_node.original_position,
+                                                       correct_positions=hit_chunk_node.current_position)
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer=layer.self_attn.attn,
+                            loc=device_indices,
+                            cache_k=k_rope,
+                            cache_v=v,
                         )
 
-                    except (json.JSONDecodeError, KeyError) as e:
-                        print(f"Error reading {metadata_path}: {e}")
-
-        return result
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -1083,18 +786,14 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong
     sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong
 
-    # 4. 将k_wrong重塑为[..., half_dim, 2]
-    k_reshaped = k_wrong.view(seq_len, num_heads_k, half_dim, 2)
-
-    # 5. 分离偶数和奇数维度
-    k_even = k_reshaped[..., 0]
-    k_odd = k_reshaped[..., 1]
+    ##fixme:  这个对应的是neox
+    k_even, k_odd = torch.chunk(k_wrong, 2, dim=-1)
 
     # 6. 应用修正旋转
     k_correct_even = k_even * cos_delta - k_odd * sin_delta
     k_correct_odd = k_even * sin_delta + k_odd * cos_delta
 
     # 7. 重新组合
-    k_correct = torch.stack([k_correct_even, k_correct_odd], dim=-1)
+    k_correct = torch.cat((k_correct_even, k_correct_odd), dim=-1)
 
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)

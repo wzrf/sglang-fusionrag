@@ -580,7 +580,7 @@ class Req:
             self.recompute_idx = []
         # shm debug
         # self.is_kv_gen = True
-        
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -906,6 +906,10 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
+
+        if not self.is_kv_gen:
+            print(f"debug")
+
         ## fixme: I delete tree cache
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
@@ -921,8 +925,10 @@ class Req:
                                  ),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
-                )
+                ),
             )
+            if not self.is_kv_gen:
+                print(f"host_hit_len={match_result.host_hit_length}, prefix_len={self.kv_gen_prefix_len}")
             if self.use_chunk_node:
                 self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
                 self.host_hit_length = match_result.host_hit_length
