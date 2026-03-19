@@ -371,10 +371,9 @@ class FusionragCache(RadixCache):
 
 
     def reset(self):
+        super().reset()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
-        self.evictable_size_ = 0
-        self.protected_size_ = 0
 
     def get_height(self, node):
         return 0
@@ -593,8 +592,8 @@ class FusionragCache(RadixCache):
                             ),  ## mengyao_debug let all be empty on the device.
                             all_hit_chunk_nodes=all_hit_chunk_nodes,
                             host_hit_length=host_hit_length,
-                            last_host_node=None,
-                            last_device_node=None,
+                            last_host_node=self.root_node,
+                            last_device_node=self.root_node,
                             no_need_to_run=True,
                         )
 
@@ -636,8 +635,8 @@ class FusionragCache(RadixCache):
                 ), ## mengyao_debug let all be empty on the device.
             all_hit_chunk_nodes=all_hit_chunk_nodes,
             host_hit_length=host_hit_length,
-            last_host_node=None,
-            last_device_node=None,
+            last_host_node=self.root_node,
+            last_device_node=self.root_node,
             no_need_to_run=False,
         )
 
@@ -834,7 +833,7 @@ class FusionragCache(RadixCache):
         torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
 
     def dec_lock_ref(self, node: ChunkNode):
-        ""
+        return 0
 
     def inc_lock_ref(self, node: ChunkNode):
-        ""
+        return 0

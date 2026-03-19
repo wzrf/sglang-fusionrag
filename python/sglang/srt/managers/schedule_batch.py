@@ -547,7 +547,7 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        self.use_chunk_node: bool = True ##mengyao_debug hardcode
+        self.use_chunk_node: bool = False
         self.hit_chunk_nodes: Any = None
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
@@ -555,6 +555,7 @@ class Req:
         self.all_compute_idx: List[int] = []
 
         if fusionrag_params is not None:
+            self.use_chunk_node = True
             ## 1. is_kv_gen=True, save_preprocess_cache=False, 直接查看raw cache里是否存在
             ## 2. is_kv_gen=True, save_preprocess_cache=True, 和raw_cache decode请求一样，去raw cache 匹配
             ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
@@ -938,6 +939,9 @@ class Req:
                 self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
                 self.host_hit_length = match_result.host_hit_length
                 self.prefix_indices = match_result.device_indices ## empty
+                self.last_node = match_result.last_device_node
+                self.last_host_node = match_result.last_host_node
+                self.cache_protected_len = len(self.prefix_indices)
                 if match_result.no_need_to_run:
                     print(f"req doesn't need to be run.")
                     self.no_need_to_run = True
