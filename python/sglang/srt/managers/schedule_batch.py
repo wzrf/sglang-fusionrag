@@ -553,18 +553,21 @@ class Req:
         self.recompute_idx: List[int] = []
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
+
         if fusionrag_params is not None:
             ## 1. is_kv_gen=True, save_preprocess_cache=False, 直接查看raw cache里是否存在
             ## 2. is_kv_gen=True, save_preprocess_cache=True, 和raw_cache decode请求一样，去raw cache 匹配
             ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
             ## 3. is_kv_gen=False, load_preprocess_cache=True, 去preprocess cache 匹配
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
-            self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
             self.save_raw_cache = not self.save_preprocess_cache
             self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
+            self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
+            self.prefix_prompt_ids_list = fusionrag_params.get("prefix_prompt_ids_list", [])
+            self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
             if self.is_kv_gen and self.save_preprocess_cache:
                 self.use_preprocess_cache = False
@@ -577,6 +580,10 @@ class Req:
             self.save_raw_cache = False
             self.use_preprocess_cache = False
             self.recompute_idx = []
+            self.prompt_ids_list = []
+            self.prefix_prompt_ids_list = []
+        # shm debug
+        # self.is_kv_gen = True
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -903,6 +910,10 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
+
+        if not self.is_kv_gen:
+            print(f"debug")
+
         ## fixme: I delete tree cache
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
@@ -914,12 +925,15 @@ class Req:
                                  prefix_prompt_text=self.prefix_prompt,
                                  is_kv_gen=self.is_kv_gen,
                                  is_preprocess_kv_gen=self.save_preprocess_cache,
-                                 use_preprocess_kv_cache=self.use_preprocess_cache
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
                                  ),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
-                )
+                ),
             )
+            if not self.is_kv_gen:
+                print(f"host_hit_len={match_result.host_hit_length}, prefix_len={self.kv_gen_prefix_len}")
             if self.use_chunk_node:
                 self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
                 self.host_hit_length = match_result.host_hit_length
