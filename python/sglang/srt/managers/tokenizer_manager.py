@@ -772,6 +772,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else:
                     print(f"mengyao_debug prefix_prompt_list should be in params.")
 
+
                 if "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(
                         recompute_str_list=obj.fusionrag_params["recompute_tokens"],

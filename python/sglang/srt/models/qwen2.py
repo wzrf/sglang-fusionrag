@@ -62,7 +62,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
-
+import re
 Qwen2Config = None
 
 
@@ -404,6 +404,7 @@ class Qwen2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
         self.fix_rope_test(forward_batch)
+        # self.save_for_debug(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -471,6 +472,39 @@ class Qwen2Model(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
+    def save_for_debug(
+        self,
+        forward_batch: ForwardBatch
+    ):
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        for req in forward_batch.reqs:
+            if req.is_kv_gen and req.save_preprocess_cache is False:
+                continue
+            input_text = req.origin_input_text
+            prefix_prompt = req.prefix_prompt
+            dir_name = copy.deepcopy(input_text[len(prefix_prompt):][:60])
+            dir_name = re.sub(r'[^a-zA-Z]', '', dir_name)
+            save_path = f"/mnt/data/xmy/mengyao_debug/sglang/{dir_name}"
+            os.makedirs(save_path, exist_ok=True)
+            if req.hit_chunk_values is not None:
+                for idx, hit_chunk_node in enumerate(req.hit_chunk_values):
+                    device_indices = hit_chunk_node.value
+                    cache = forward_batch.token_to_kv_pool.get_cpu_copy(device_indices)
+                    k_cache = []
+                    v_cache = []
+                    for kv in cache:
+                        k_cache.append(kv[0][0])
+                        v_cache.append(kv[0][1])
+                    k_cache = torch.stack(k_cache)
+                    v_cache = torch.stack(v_cache)
+                    k_save_path = f"{save_path}/k_cache_{idx}.pt"
+                    torch.save(k_cache, k_save_path)
+                    v_save_path = f"{save_path}/v_cache_{idx}.pt"
+                    torch.save(v_cache, v_save_path)
+
     def fix_rope_test(
         self,
         forward_batch
@@ -480,6 +514,8 @@ class Qwen2Model(nn.Module):
         if forward_batch is None or forward_batch.reqs is None:
             return
         for req in forward_batch.reqs:
+            if req.is_kv_gen:
+                continue
             if req.hit_chunk_values is not None:
                 for layer_id, layer in enumerate(self.layers):
                     for hit_chunk_node in req.hit_chunk_values:
@@ -796,4 +832,4 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     # 7. 重新组合
     k_correct = torch.cat((k_correct_even, k_correct_odd), dim=-1)
 
-    return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
+    return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype).contiguous()
