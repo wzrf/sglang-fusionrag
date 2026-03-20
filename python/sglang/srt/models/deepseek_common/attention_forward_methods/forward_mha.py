@@ -360,13 +360,30 @@ class DeepseekMHAForwardMixin:
         scaling: float
     ):
         seq_len_q = q.shape[0]
-        seq_len = k.shape[0]
+        seq_len_k = k.shape[0]
+        num_heads = 28
+        num_kv_heads = 4
+        head_dim = 128
+
+        # 1. 重塑为多头形式
+        q = q.view(seq_len_q, num_heads, head_dim)  # (seq_len_q, 28, 128)
+        k = k.view(seq_len_k, num_kv_heads, head_dim)  # (seq_len_k, 4, 128)
+        v = v.view(seq_len_k, num_kv_heads, head_dim)  # (seq_len_k, 4, 128)
+
+        # 2. 分组查询注意力（GQA）：将 kv 头复制到与 q 头相同的数量
+        repeat_factor = num_heads // num_kv_heads  # 28 // 4 = 7
+        k = k.repeat_interleave(repeat_factor, dim=1)  # (seq_len_k, 28, 128)
+        v = v.repeat_interleave(repeat_factor, dim=1)  # (seq_len_k, 28, 128)
+
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
-        scores = torch.matmul(q, k.transpose(-2, -1))
-        scores = scores * scaling
+        # 3. 计算注意力分数
+        # scores: (seq_len_q, 28, seq_len_k)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scaling
+        # print(f"q shape={q.shape}, k shape={k.shape}, v shape={v.shape}")
 
-        mask = torch.zeros(seq_len_q, seq_len, dtype=torch.bool).to(scores.device)
+        # 4. 构建掩码
+        mask = torch.zeros(seq_len_q, seq_len_k, dtype=torch.bool, device=scores.device)
         if forward_batch.fusion_rag_indices is not None:
             for i, q_idx in enumerate(forward_batch.fusion_rag_indices):
                 mask[i, q_idx + 1:] = True  # True表示要mask掉的位置
@@ -376,10 +393,16 @@ class DeepseekMHAForwardMixin:
 
         scores = scores.masked_fill(mask, float('-inf'))
 
+        # 5. 计算注意力权重和输出
         attn = torch.softmax(scores, dim=-1)
-        o = torch.matmul(attn, v.transpose(0, 1))
+        v = v.transpose(0, 1)
+        # print(f"v shape={v.shape}, attn shape={attn.shape}")
+        o = torch.matmul(attn, v)
+        # print(f"o shape = {o.shape}")
         o = o.transpose(0, 1).contiguous()
         o = o.view(o.shape[0], -1)
+
+        # print(f"o.shape={o.shape}")
         return o
 
 
