@@ -783,9 +783,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 ##mengyao_debug hardcode
                 elif obj.fusionrag_params.get("recompute_debug", False) == True:
                     import random
+                    recompute_rate = obj.fusionrag_params.get("recompute_debug_rate", 0.3)
+                    print(f"recompute_debug_rate = {recompute_rate}")
                     length = len(input_ids) - 1
                     if length > 0:
-                        recompute_length = int(len(input_ids) * 0.2)
+                        recompute_length = int(len(input_ids) * recompute_rate)
                         numbers = random.sample(range(length), recompute_length)
                         numbers.sort()
                         obj.fusionrag_params["recompute_idx"] = numbers
