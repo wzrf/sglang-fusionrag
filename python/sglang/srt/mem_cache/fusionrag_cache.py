@@ -640,6 +640,28 @@ class FusionragCache(RadixCache):
             no_need_to_run=False,
         )
 
+    def _get_saved_prefix_token_len(self, req: Req, kv_prefix_len: int) -> int:
+        """Return the prefix length that should be recorded with this cache entry.
+
+        Raw cache should keep its original prefix length. For preprocess cache we
+        intentionally store the suffix KV in a canonical coordinate system that
+        starts right after the system prompt, mirroring the torch implementation.
+        In that case the metadata and in-memory node must record `system_len`
+        instead of the original `system + relevant_docs` length, otherwise load-time
+        RoPE correction would rotate from the wrong anchor.
+        """
+        if not req.save_preprocess_cache:
+            return kv_prefix_len
+
+        prefix_prompt_ids_list = getattr(req, "prefix_prompt_ids_list", None) or []
+        if not prefix_prompt_ids_list:
+            return kv_prefix_len
+
+        system_len = len(prefix_prompt_ids_list[0])
+        if kv_prefix_len <= system_len:
+            return kv_prefix_len
+        return system_len
+
     def insert(
         self,
         key: RadixKey,
@@ -746,24 +768,26 @@ class FusionragCache(RadixCache):
             values = kv_indices.to(dtype=torch.int64, copy=True)
 
             kv_prefix_len = req.kv_gen_prefix_len ## this is right
+            saved_prefix_len = self._get_saved_prefix_token_len(req, kv_prefix_len)
             text_without_prefix_ids = req.origin_input_ids[kv_prefix_len:]
             assert len(text_without_prefix_ids) == len(values) - kv_prefix_len
             print(f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
                   f"values={len(values)}\n"
-                  f"kv_prefix_len={kv_prefix_len}\n")
+                  f"kv_prefix_len={kv_prefix_len}\n"
+                  f"saved_prefix_len={saved_prefix_len}\n")
             self.insert(
                 radix_key,
                 values[kv_prefix_len:], ## 不存储prefix部分
                 priority=0,
                 is_kv_gen=True,
-                kv_gen_prefix_len=kv_prefix_len,
+                kv_gen_prefix_len=saved_prefix_len,
                 is_preprocess_cache=req.save_preprocess_cache,
                 text_without_prefix_ids=text_without_prefix_ids
             )
             prompt_ids = req.origin_input_ids
             prefix_prompt_ids = req.kv_gen_prefix_len
             prompt_ids_without_prefix = prompt_ids[prefix_prompt_ids:]
-            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
+            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], saved_prefix_len,
                                       prompt_ids_without_prefix) ## 不存储prefix部分
 
         ## either case 都要把显存清理掉，要把output_ids部分也清理掉

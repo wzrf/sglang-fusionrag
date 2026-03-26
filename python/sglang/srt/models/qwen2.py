@@ -69,6 +69,25 @@ Qwen2Config = None
 logger = logging.getLogger(__name__)
 
 
+def _should_force_qwen2_native_rmsnorm() -> bool:
+    """Allow quick A/B testing against the fused CUDA RMSNorm path.
+
+    We default to the native fp32 RMSNorm for Qwen2 in this branch because the
+    current investigation is specifically about numerical drift between the
+    SGLang and torch implementations. Set
+    `SGLANG_QWEN2_FORCE_NATIVE_RMSNORM=0` to restore the original fused path.
+    """
+    value = os.environ.get("SGLANG_QWEN2_FORCE_NATIVE_RMSNORM", "1")
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+def _build_qwen2_rmsnorm(*args, **kwargs) -> RMSNorm:
+    norm = RMSNorm(*args, **kwargs)
+    if _should_force_qwen2_native_rmsnorm():
+        norm._forward_method = norm.forward_native
+    return norm
+
+
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -268,8 +287,10 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = _build_qwen2_rmsnorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = _build_qwen2_rmsnorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -355,7 +376,7 @@ class Qwen2Model(nn.Module):
                 if get_global_server_args().rl_on_policy_target is not None
                 else {}
             )
-            self.norm = RMSNorm(
+            self.norm = _build_qwen2_rmsnorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
             )
         else:
@@ -445,8 +466,10 @@ class Qwen2Model(nn.Module):
 
 
         if len(aux_hidden_states) == 0:
+            self.normalize_preprocess_save_cache(forward_batch)
             return hidden_states
 
+        self.normalize_preprocess_save_cache(forward_batch)
         return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
@@ -534,6 +557,96 @@ class Qwen2Model(nn.Module):
                             cache_k=k_rope,
                             cache_v=v,
                         )
+
+    def normalize_preprocess_save_cache(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Normalize preprocess suffix KV to the same anchor used by torch.
+
+        Torch stores preprocess suffix KV as if the current document always starts
+        right after the system prompt. Later, when the document is reused under a
+        different prefix, load-time RoPE correction rotates it from that canonical
+        anchor to the current position.
+
+        SGLang previously kept preprocess suffix KV at the *actual* position used
+        during cache construction, i.e. after `system + relevant_docs`. That means
+        the saved KV already encoded the old prefix length. To make SGLang reuse
+        semantics consistent with torch, we rewrite the saved suffix KV *after the
+        forward pass is finished*:
+
+        - `wrong_positions`: real positions used during preprocess construction
+        - `correct_positions`: canonical positions that start at `system_len`
+
+        This rewrite happens after all layers have already consumed the KV for the
+        current forward pass, so it does not affect the correctness of the ongoing
+        request. It only changes what will later be persisted into host/disk cache.
+        """
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        if forward_batch.req_to_token_pool is None:
+            return
+
+        for req in forward_batch.reqs:
+            if not req.is_kv_gen or not req.save_preprocess_cache or req.no_need_to_run:
+                continue
+
+            prefix_prompt_ids_list = getattr(req, "prefix_prompt_ids_list", None) or []
+            # The first prompt segment is the canonical system prompt anchor that
+            # torch uses when it normalizes preprocess KV.
+            if not prefix_prompt_ids_list:
+                continue
+
+            system_len = len(prefix_prompt_ids_list[0])
+            actual_prefix_len = req.kv_gen_prefix_len
+            if actual_prefix_len <= system_len:
+                # Already anchored at system_len (or this is the system cache).
+                continue
+
+            seq_len = len(req.origin_input_ids)
+            if seq_len <= actual_prefix_len:
+                continue
+            if req.req_pool_idx is None:
+                continue
+
+            suffix_indices = forward_batch.req_to_token_pool.req_to_token[
+                req.req_pool_idx, actual_prefix_len:seq_len
+            ]
+            if suffix_indices.numel() == 0:
+                continue
+
+            wrong_positions = torch.arange(
+                actual_prefix_len,
+                actual_prefix_len + suffix_indices.numel(),
+                device=suffix_indices.device,
+            )
+            correct_positions = torch.arange(
+                system_len,
+                system_len + suffix_indices.numel(),
+                device=suffix_indices.device,
+            )
+
+            for layer_id, layer in enumerate(self.layers):
+                if isinstance(layer, nn.Identity):
+                    continue
+
+                k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                k = k_[suffix_indices]
+                v = v_[suffix_indices]
+                k_normalized = correct_rope_rotation(
+                    k,
+                    layer.self_attn.rotary_emb.cos_sin_cache,
+                    wrong_positions=wrong_positions,
+                    correct_positions=correct_positions,
+                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer=layer.self_attn.attn,
+                    loc=suffix_indices,
+                    cache_k=k_normalized,
+                    cache_v=v,
+                )
 
 
 

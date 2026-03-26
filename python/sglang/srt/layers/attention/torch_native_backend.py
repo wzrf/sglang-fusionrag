@@ -35,6 +35,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        extend_all_compute_len: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -51,6 +53,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
             extend_seq_lens: [num_seqs]
+            extend_all_compute_len: [num_seqs]. Length of the actual query block
+                after inserting recomputed prefix tokens back into the extend batch.
+            positions: [num_tokens]. Absolute token positions for each query token.
             scaling: float or None
             enable_gqa: bool
             causal: bool
@@ -61,30 +66,48 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+        if extend_all_compute_len is not None:
+            assert seq_lens.shape[0] == extend_all_compute_len.shape[0]
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q, start_kv = 0, 0
+        start_q = 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
 
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
-
             seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
+
+            # When fusionrag asks for prefix recompute, the query block is no longer
+            # just the contiguous extend tail. It becomes:
+            #   recompute_idx (sparse prefix positions) + extend tail positions
+            # `positions` stores the absolute position of every query token, so we
+            # can build the same causal visibility rule as the Triton backend:
+            # a query at position q_idx may only attend to keys in [0, q_idx].
+            total_query_len = (
+                int(extend_all_compute_len[seq_idx])
+                if extend_all_compute_len is not None
+                else int(extend_seq_len_q)
+            )
+            end_q = start_q + total_query_len
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            if positions is not None:
+                per_req_positions = positions[start_q:end_q].to(
+                    device=per_req_query.device, dtype=torch.int64
+                )
+            else:
+                # Fallback to the original contiguous extend semantics when the
+                # caller does not provide explicit positions.
+                per_req_positions = torch.arange(
+                    int(prefill_seq_len_q),
+                    int(prefill_seq_len_q) + total_query_len,
+                    device=per_req_query.device,
+                    dtype=torch.int64,
+                )
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -98,20 +121,38 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            per_req_out_redudant = (
+            attn_mask = None
+            sdpa_is_causal = causal
+            if causal:
+                # Torch SDPA uses query-local causal masking, which is only correct
+                # for a contiguous suffix. For fusionrag prefix recompute we must
+                # express the absolute token positions explicitly, otherwise sparse
+                # prefix queries would see the wrong future tokens.
+                kv_positions = torch.arange(
+                    int(seq_len_kv),
+                    device=per_req_query.device,
+                    dtype=torch.int64,
+                )
+                attn_mask = (
+                    kv_positions.unsqueeze(0) <= per_req_positions.unsqueeze(1)
+                ).unsqueeze(0).unsqueeze(0)
+                sdpa_is_causal = False
+
+            per_req_out = (
                 scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
+                    attn_mask=attn_mask,
                     enable_gqa=enable_gqa,
                     scale=scaling,
-                    is_causal=causal,
+                    is_causal=sdpa_is_causal,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
-            start_q, start_kv = end_q, end_kv
+            output[start_q:end_q, :, :] = per_req_out
+            start_q = end_q
         return output
 
     def _run_sdpa_forward_decode(
@@ -230,6 +271,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
+            extend_all_compute_len=forward_batch.extend_all_compute_len,
+            positions=forward_batch.positions,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,

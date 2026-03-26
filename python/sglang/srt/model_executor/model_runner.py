@@ -630,12 +630,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def model_specific_adjustment(self):
         server_args = self.server_args
+        architectures = getattr(self.model_config.hf_config, "architectures", None) or [
+            None
+        ]
+        model_arch = architectures[0]
 
         if server_args.enable_double_sparsity:
             logger.info(
                 "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
             )
             server_args.attention_backend = "triton"
+            server_args.disable_cuda_graph = True
+
+        if (
+            model_arch == "Qwen2ForCausalLM"
+            and os.environ.get("SGLANG_QWEN2_FORCE_TORCH_SDPA", "1") != "0"
+        ):
+            # Qwen2 fusionrag needs the same SDPA semantics as the torch baseline.
+            # Force both prefill and decode onto torch_native unless the env var
+            # explicitly disables this for A/B experiments.
+            if (
+                server_args.attention_backend != "torch_native"
+                or server_args.prefill_attention_backend is not None
+                or server_args.decode_attention_backend is not None
+            ):
+                logger.info(
+                    "Force Qwen2 attention backend to torch_native SDPA. "
+                    "Set SGLANG_QWEN2_FORCE_TORCH_SDPA=0 to disable."
+                )
+            server_args.attention_backend = "torch_native"
+            server_args.prefill_attention_backend = None
+            server_args.decode_attention_backend = None
             server_args.disable_cuda_graph = True
 
         if self.is_multimodal:
