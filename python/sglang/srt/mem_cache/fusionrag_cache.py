@@ -572,7 +572,6 @@ class FusionragCache(RadixCache):
         )
         return loading_values, values_list
         ""
-
     def match_prefix(self, params: MatchPrefixParams):
         all_hit_chunk_nodes = []
         host_hit_length = 0

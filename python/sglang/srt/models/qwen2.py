@@ -201,8 +201,8 @@ class Qwen2Attention(nn.Module):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer=self.attn,
                 loc=forward_batch.out_cache_loc,
-                cache_k=k,
-                cache_v=v,
+                cache_k=k.reshape(-1, self.num_kv_heads, self.head_dim),
+                cache_v=v.reshape(-1, self.num_kv_heads, self.head_dim),
             )
             kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
             k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
