@@ -195,11 +195,6 @@ class SharedFullContext:
             )
         self.gpu_layer.quant_method = self.gpu_method
 
-        # Detect quantization type for weight loading
-        self.is_fp8_quant = self._detect_fp8_quant()
-        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
-        self.is_bf16_quant = self._detect_bf16_quant()
-
         self.gpu_method.create_weights(
             layer=self.gpu_layer,
             num_experts=global_num_experts,
@@ -207,6 +202,11 @@ class SharedFullContext:
             intermediate_size_per_partition=intermediate_size_per_partition,
             params_dtype=params_dtype,
         )
+
+        # Detect quantization type for weight loading based on actually created weights.
+        # This is more robust than class-based detection when quant methods are wrapped
+        # (e.g., KT wrapper -> compressed-tensors scheme), especially in layerwise prefill.
+        self._detect_quant_type_from_created_weights()
 
         # Move all parameters to target device
         for param in self.gpu_layer.parameters():
@@ -227,6 +227,70 @@ class SharedFullContext:
         self.gpu_layer.moe_runner_config = runner_config
         self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
 
+    def _get_base_quant_method(self):
+        """Unwrap nested quant methods to get the underlying base method.
+
+        Some paths may wrap the real quant method with KT wrappers/schemes.
+        """
+        method = self.gpu_method
+        visited = set()
+
+        while method is not None and id(method) not in visited:
+            visited.add(id(method))
+
+            # KT wrapper pattern: method.gpu_method
+            nested = getattr(method, "gpu_method", None)
+            if nested is not None and nested is not method:
+                method = nested
+                continue
+
+            # Compressed-tensors scheme pattern: method.scheme
+            nested = getattr(method, "scheme", None)
+            if nested is not None and nested is not method:
+                method = nested
+                continue
+
+            break
+
+        return method
+
+    def _detect_quant_type_from_created_weights(self) -> None:
+        """Detect quant type from weight attributes created on gpu_layer."""
+        layer = self.gpu_layer
+
+        # INT4 Marlin
+        if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # FP8 block
+        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            self.is_fp8_quant = True
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # FP8 per-channel
+        if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = True
+            self.is_bf16_quant = False
+            return
+
+        # BF16 / unquantized
+        if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = True
+            return
+
+        # Fallback to class-based detection for unknown layouts.
+        self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
+        self.is_bf16_quant = self._detect_bf16_quant()
+
     def _detect_fp8_quant(self) -> bool:
         """Detect if the quantization method is FP8 block quant.
 
@@ -235,7 +299,7 @@ class SharedFullContext:
         """
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         # Check for Fp8MoEMethod with block_quant
         if isinstance(method, Fp8MoEMethod) and getattr(method, "block_quant", False):
             return True
@@ -262,7 +326,7 @@ class SharedFullContext:
         except ImportError:
             return False
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         method_name = method.__class__.__name__
 
         # Check for CompressedTensorsW8A8Fp8MoEMethod with channel strategy
@@ -284,12 +348,53 @@ class SharedFullContext:
             UnquantizedFusedMoEMethod,
         )
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         # Check for UnquantizedFusedMoEMethod
         if isinstance(method, UnquantizedFusedMoEMethod):
             return True
 
         return False
+
+    def _resolve_int4_quant_params(self):
+        """Resolve INT4 quant params from potentially wrapped quant methods.
+
+        Some quantization paths (e.g., compressed-tensors) expose INT4 metadata on
+        the underlying scheme instead of the outer fused method wrapper.
+        """
+        candidates = []
+        seen = set()
+
+        def add_candidate(obj):
+            if obj is None:
+                return
+            obj_id = id(obj)
+            if obj_id in seen:
+                return
+            seen.add(obj_id)
+            candidates.append(obj)
+
+        base_method = self._get_base_quant_method()
+        add_candidate(self.gpu_method)
+        add_candidate(getattr(self.gpu_method, "gpu_method", None))
+        add_candidate(getattr(self.gpu_method, "scheme", None))
+        add_candidate(base_method)
+        add_candidate(getattr(base_method, "scheme", None))
+        add_candidate(getattr(self.gpu_layer, "scheme", None))
+
+        required = ("num_bits", "packed_factor", "group_size")
+        for candidate in candidates:
+            if all(hasattr(candidate, attr) for attr in required):
+                return (
+                    getattr(candidate, "num_bits"),
+                    getattr(candidate, "packed_factor"),
+                    getattr(candidate, "group_size"),
+                    getattr(candidate, "actorder", None),
+                )
+
+        raise AttributeError(
+            "Unable to resolve INT4 quantization params: expected attributes "
+            "num_bits/packed_factor/group_size on quant method or scheme"
+        )
 
     @property
     def weight_names(self) -> list:
@@ -451,12 +556,9 @@ class SharedFullContext:
         os.sched_setaffinity(0, {target_cpu})
 
         layer = self.gpu_layer
-        method = self.gpu_method
-
-        num_bits = method.num_bits
-        packed_factor = method.packed_factor
-        group_size = method.group_size
-        actorder = getattr(method, "actorder", None)
+        num_bits, packed_factor, group_size, actorder = (
+            self._resolve_int4_quant_params()
+        )
         num_experts = layer.num_experts
         device = layer.w13_weight_packed.device
 
@@ -595,6 +697,11 @@ class SharedFullContext:
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
                 if e + 1 < num_experts:
+                    # Before writing to slot (e+1)%2, make sure the previous
+                    # copy from that slot has completed to avoid overwriting
+                    # pinned host memory while DMA is in-flight.
+                    if e > 0:
+                        events[e - 1].synchronize()
                     submit_write_expert(e + 1)
 
             # Barrier to ensure all ranks see the written data
@@ -1310,7 +1417,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     if _KT_GPU_EXPERTS_MASKS is not None:
         return _KT_GPU_EXPERTS_MASKS
 
-    # Get model config
+    # Get model config (unwrap VL configs that nest the text model config)
     hf_config = server_args.get_hf_config()
 
     # fix for kimi-k2.5 models where text_config holds the actual config
@@ -1334,6 +1441,14 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Get first_k_dense_replace to identify which layers are MoE layers
     first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
+
+    # Normalize list-form moe_layer_freq (e.g., MiMo-V2-Flash: [0, 1, 1, ...])
+    # to standard (first_k_dense_replace, moe_layer_freq=1) form
+    if isinstance(moe_layer_freq, list):
+        # Find first MoE layer index from the mask
+        first_moe = next((i for i, v in enumerate(moe_layer_freq) if v), 0)
+        first_k_dense_replace = max(first_k_dense_replace or 0, first_moe)
+        moe_layer_freq = 1
 
     # Count actual MoE layers
     num_moe_layers = sum(
@@ -1534,8 +1649,10 @@ def create_kt_config_from_server_args(
     # Get mask for this specific layer
     gpu_experts_mask = masks[layer_idx]
 
-    # Get num_layers from model config
+    # Get num_layers from model config (unwrap VL configs)
     hf_config = server_args.get_hf_config()
+    if hasattr(hf_config, "text_config"):
+        hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
 
     return KTConfig(
@@ -2009,11 +2126,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 get_global_expert_location_metadata,
             )
 
-            physical_to_logical_map_cpu = (
-                get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                .contiguous()
-            )
+            metadata = get_global_expert_location_metadata()
+            if (
+                metadata is not None
+                and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+            ):
+                physical_to_logical_map_cpu = (
+                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                    .contiguous()
+                )
+            else:
+                # Fallback for setups without EPLB metadata: identity mapping.
+                physical_to_logical_map_cpu = torch.arange(
+                    layer.num_experts, dtype=torch.int64, device="cpu"
+                )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(

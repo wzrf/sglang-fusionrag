@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
@@ -293,7 +293,7 @@ class FusionragCache(RadixCache):
             prefetch_length = chunk_tensor.shape[1]
             try:
                 if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[0]:
-                    print(f"shape mismatch.")
+                    # print(f"shape mismatch.")
                     continue
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
                 if host_indices is None:
@@ -786,7 +786,7 @@ class FusionragCache(RadixCache):
             except Exception as E:
                 print(f"cache finish req error. E={E}, node={node}")
 
-        self.req_to_token_pool.free(req.req_pool_idx)
+        # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
         kv_cache = []
