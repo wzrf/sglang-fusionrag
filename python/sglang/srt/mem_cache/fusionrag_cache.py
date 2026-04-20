@@ -231,13 +231,13 @@ class FusionragCache(RadixCache):
 
         cache_path_root = "/mnt/data3"
         served_model_name = server_args.served_model_name
-        # if not os.path.exists(cache_path_root):
-        #     cache_path_root = "/mnt/data"
-        self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+        if not os.path.exists(cache_path_root):
+            cache_path_root = "/mnt/data"
+        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
+        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -767,15 +767,14 @@ class FusionragCache(RadixCache):
             self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
                                       prompt_ids_without_prefix) ## 不存储prefix部分
 
-        ## either case 都要把显存清理掉，要把output_ids部分也清理掉
-        kv_committed_len = req.pop_committed_kv_cache()
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
-        ##todo 这里有问题，prefix_len 设置成了0，所以只把alloc_extend申请的内存free掉了，但是prefix的内存没有free掉。
-        ##todo 还是把prefix_len改成对的吧
-        self.cache_controller.mem_pool_device_allocator.free(kv_indices)
+            ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
+            kv_committed_len = req.pop_committed_kv_cache()
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            self.cache_controller.mem_pool_device_allocator.free(kv_indices)
+
         for node_idx, node in enumerate(req.hit_chunk_nodes):
             value_to_remove = req.hit_chunk_values[node_idx].value
             try:

@@ -352,19 +352,19 @@ def alloc_for_extend(
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        batch.req_to_token_pool, batch.reqs, batch.tree_cache_hicache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    if batch.tree_cache_hicache.page_size == 1:
         # out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
         out_cache_loc = torch.tensor([]).to(batch.device)
         out_cache_loc_extends = torch.tensor([]).to(batch.device)
         for i, req in enumerate(batch.reqs):
             recompute_cache_index = recompute_cache_indices[i]
-            out_cache_loc_extend = alloc_token_slots(batch.tree_cache, len(input_ids_only_extend[i]))
+            out_cache_loc_extend = alloc_token_slots(batch.tree_cache_hicache, len(input_ids_only_extend[i]))
             out_cache_loc = torch.cat([out_cache_loc, recompute_cache_index, out_cache_loc_extend]).to(torch.int64)
             out_cache_loc_extends = torch.cat([out_cache_loc_extends, out_cache_loc_extend]).to(torch.int64)
 
@@ -457,9 +457,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     bs = batch.seq_lens.shape[0]
 
-    if batch.tree_cache.page_size == 1:
+    if batch.tree_cache_hicache.page_size == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        out_cache_loc = alloc_token_slots(batch.tree_cache_hicache, bs * token_per_req)
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -467,7 +467,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         ]
         seq_lens_next = batch.seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
+            tree_cache=batch.tree_cache_hicache,
             seq_lens=seq_lens_next,
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
@@ -501,7 +501,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    if not req.is_kv_gen:
+        tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 

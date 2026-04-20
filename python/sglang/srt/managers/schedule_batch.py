@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align
@@ -545,7 +544,8 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        self.use_chunk_node: bool = True ##mengyao_debug hardcode
+        self.use_chunk_node: bool = False ##mengyao_debug hardcode
+        self.use_mix_prefix_cache: bool = False
         self.hit_chunk_nodes: Any = None
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
@@ -670,6 +670,8 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_indices_hicache: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_indices_fusionrag: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -677,6 +679,8 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.host_hit_length_hicache = 0
+        self.host_hit_length_fusionrag = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -902,7 +906,8 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(self, tree_cache_hicache: Optional[BasePrefixCache] = None,
+                              tree_cache_fusionrag: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -918,12 +923,9 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
 
-        if not self.is_kv_gen:
-            print(f"debug")
-
-        ## fixme: I delete tree cache
-        if tree_cache is not None:
-            match_result = tree_cache.match_prefix(
+        ## if it's kv gen, only use fusion rag cache.
+        if self.is_kv_gen:
+            match_result = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
                     # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
                     key=RadixKey(token_ids=token_ids,
@@ -935,35 +937,71 @@ class Req(ReqDllmMixin):
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
                                  prefix_prompt_ids_list=self.prefix_prompt_ids_list
                                  ),
-                    req=self if tree_cache.supports_mamba() else None,
-                    cow_mamba=tree_cache.supports_mamba(),
+                    req=self if tree_cache_fusionrag.supports_mamba() else None,
+                    cow_mamba=tree_cache_fusionrag.supports_mamba(),
                 ),
             )
-            if not self.is_kv_gen:
-                print(f"host_hit_len={match_result.host_hit_length}, prefix_len={self.kv_gen_prefix_len}")
-            if self.use_chunk_node:
-                self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
-                self.host_hit_length = match_result.host_hit_length
-                self.prefix_indices = match_result.device_indices ## empty
-                if match_result.no_need_to_run:
-                    print(f"req doesn't need to be run.")
-                    self.no_need_to_run = True
+            self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
+            self.host_hit_length = match_result.host_hit_length
+            self.prefix_indices = match_result.device_indices  ## empty
+            if match_result.no_need_to_run:
+                print(f"req doesn't need to be run.")
+                self.no_need_to_run = True
+        else:
+            match_result_prefix = tree_cache_hicache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text,
+                                 prefix_prompt_text=self.prefix_prompt,
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 ),
+                    req=self if tree_cache_hicache.supports_mamba() else None,
+                    cow_mamba=tree_cache_hicache.supports_mamba(),
+                ),
+            )
 
-            else:
-                (
-                    self.prefix_indices,
-                    self.last_node,
-                    self.last_host_node,
-                    self.host_hit_length,
-                    self.mamba_branching_seqlen,
-                ) = (
-                    match_result.device_indices,
-                    match_result.last_device_node,
-                    match_result.last_host_node,
-                    match_result.host_hit_length,
-                    match_result.mamba_branching_seqlen,
-                )
-                self.cache_protected_len = len(self.prefix_indices)
+            (
+                self.prefix_indices_hicache,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length_hicache,
+                self.mamba_branching_seqlen,
+            ) = (
+                match_result_prefix.device_indices,
+                match_result_prefix.last_device_node,
+                match_result_prefix.last_host_node,
+                match_result_prefix.host_hit_length,
+                match_result_prefix.mamba_branching_seqlen,
+            )
+            self.cache_protected_len = len(self.prefix_indices)
+
+            match_result_fusionrag = tree_cache_fusionrag.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text, ## todo mengyao_debug 这里不用改，用不到
+                                 prefix_prompt_text=self.prefix_prompt, ## todo mengyao_debug 这里需要改，改成从chunk位置开始匹配
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 ),
+                    req=self if tree_cache_hicache.supports_mamba() else None,
+                    cow_mamba=tree_cache_hicache.supports_mamba(),
+                ),
+            )
+
+            self.hit_chunk_nodes = match_result_fusionrag.all_hit_chunk_nodes
+            self.host_hit_length_fusionrag = match_result_fusionrag.host_hit_length
+            self.prefix_indices_fusionrag = match_result_fusionrag.device_indices  ## empty, will be assigned at add_one_req later.
+
+            self.prefix_indices = self.prefix_indices_hicache ## mengyao_debug: in fusionrag cache this is empty.
+            self.host_hit_length = self.host_hit_length_fusionrag + self.host_hit_length_hicache
+
 
         if (
             self.is_retracted
@@ -1250,7 +1288,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
-    tree_cache: BasePrefixCache = None
+    tree_cache_hicache: BasePrefixCache = None
+    tree_cache_fusionrag: BasePrefixCache = None
     is_hybrid_swa: bool = False
 
     # Batch configs
@@ -1359,7 +1398,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = -1
+    hicache_consumer_index: list[int] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -1374,7 +1413,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        tree_cache: BasePrefixCache,
+        tree_cache_hicache: BasePrefixCache,
+        tree_cache_fusionrag: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
@@ -1391,7 +1431,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
+            tree_cache_hicache=tree_cache_hicache,
+            tree_cache_fusionrag=tree_cache_fusionrag,
             is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -1504,7 +1545,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         recompute_cache_indices = []
         for r in reqs:
-            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
+            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
             r.all_compute_idx.extend(extend_compute_idx)
@@ -1902,7 +1943,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(self.tree_cache_hicache, num_tokens) ##
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
@@ -1984,7 +2025,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(self.tree_cache_hicache, num_tokens)
 
         req.reset_for_retract()
 
@@ -2335,14 +2376,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
-        if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+        if self.tree_cache_hicache.supports_swa():
+            sliding_window_size = self.tree_cache_hicache.sliding_window_size
             server_args = get_global_server_args()
 
             if (
                 self.forward_mode.is_decode()
                 and server_args.enable_piecewise_cuda_graph
-                and not self.tree_cache.is_chunk_cache()
+                and not self.tree_cache_hicache.is_chunk_cache()
             ):
                 return
 
@@ -2353,7 +2394,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every window_size tokens to reduce the overhead.
                     if req.decode_batch_idx % sliding_window_size == 1:
                         self._evict_swa(req, req.seqlen - 1)
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and self.tree_cache_hicache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
@@ -2370,12 +2411,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
-        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
+        assert self.tree_cache_hicache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = self.tree_cache_hicache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
         assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
+            req.cache_protected_len % self.tree_cache_hicache.page_size == 0
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
@@ -2383,10 +2424,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.swa_evicted_seqlen, pre_len - sliding_window_size
         )
 
-        if self.tree_cache.page_size > 1:
+        if self.tree_cache_hicache.page_size > 1:
             new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
+                new_swa_evicted_seqlen // self.tree_cache_hicache.page_size
+            ) * self.tree_cache_hicache.page_size
 
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[
@@ -2469,7 +2510,7 @@ class ModelWorkerBatch:
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = -1
+    hicache_consumer_index: list[int] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

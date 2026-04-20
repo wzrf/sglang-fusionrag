@@ -79,6 +79,9 @@ _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 
+def wait_for_all(counters: list[LayerDoneCounter], index):
+    for counter in counters:
+        counter.wait_until(index)
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
@@ -632,7 +635,7 @@ class KVCache(abc.ABC):
         self.cpu_offloading_chunk_size = 8192
 
         # default state for optional layer-wise transfer control
-        self.layer_transfer_counter = None
+        self.layer_transfer_counter = []
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -682,7 +685,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+        self.layer_transfer_counter.append(layer_transfer_counter)
 
     def get_cpu_copy(self, indices):
         raise NotImplementedError()
@@ -1467,8 +1470,8 @@ class MLATokenToKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
+            # self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -1476,8 +1479,8 @@ class MLATokenToKVPool(KVCache):
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
+            # self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
@@ -1639,7 +1642,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            # self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
             cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
@@ -1806,7 +1810,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            # self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
 
     def get_index_k_continuous(

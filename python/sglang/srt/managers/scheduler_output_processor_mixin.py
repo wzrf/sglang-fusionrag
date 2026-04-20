@@ -184,11 +184,12 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self.tree_cache_fusionrag.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache_hicache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        self.tree_cache_hicache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -479,7 +480,9 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    # release_kv_cache(req, self.tree_cache_fusionrag)
+                    self.tree_cache_fusionrag.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache_hicache)
 
                 req.time_stats.set_completion_time()
 

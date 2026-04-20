@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class SchedulerRuntimeCheckerMixin:
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        evictable_size = self.tree_cache_hicache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
@@ -149,7 +149,7 @@ class SchedulerRuntimeCheckerMixin:
 
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
-        protected_size = self.tree_cache.protected_size()
+        protected_size = self.tree_cache_hicache.protected_size()
         memory_leak = (available_size + evictable_size) != (
             # self.max_total_num_tokens
             # if not self.enable_hierarchical_cache
@@ -308,11 +308,11 @@ class SchedulerRuntimeCheckerMixin:
 
     def check_tree_cache(self: Scheduler):
         if (
-            self.tree_cache.is_tree_cache()
-            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
-            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
+            self.tree_cache_hicache.is_tree_cache()
+            and (self.is_hybrid_swa and self.tree_cache_hicache.supports_swa())
+            or (self.is_hybrid_ssm and self.tree_cache_hicache.supports_mamba())
         ):
-            self.tree_cache.sanity_check()
+            self.tree_cache_hicache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

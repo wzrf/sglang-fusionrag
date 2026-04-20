@@ -675,14 +675,15 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if not self.is_hybrid_swa:
-                from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-                self.tree_cache = ChunkCache(params)
-            else:
-                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-                self.tree_cache = SWAChunkCache(params)
+            ""
+            # if not self.is_hybrid_swa:
+            #     from sglang.srt.mem_cache.chunk_cache import ChunkCache
+            #
+            #     self.tree_cache = ChunkCache(params)
+            # else:
+            #     from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+            #
+            #     self.tree_cache = SWAChunkCache(params)
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
@@ -690,38 +691,47 @@ class Scheduler(
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
                 logger.info("Using experimental C++ radix tree implementation.")
-                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
+                # self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
                 from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
 
-                # self.tree_cache = HiRadixCache(params=params, server_args=server_args)
-                self.tree_cache = FusionragCache(params=params, server_args=server_args) ##mengyao_debug hardcode
+                self.tree_cache_hicache = HiRadixCache(params=params, server_args=server_args)
+                self.tree_cache_fusionrag = FusionragCache(params=params, server_args=server_args) ##mengyao_debug hardcode
                 self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
+                    self.tree_cache_hicache.cache_controller.layer_done_counter
                 )
-            elif self.is_hybrid_swa:
-                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-                self.tree_cache = SWARadixCache(params=params)
-            elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-                self.tree_cache = MambaRadixCache(params)
-            elif server_args.enable_lmcache:
-                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                    LMCRadixCache,
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache_fusionrag.cache_controller.layer_done_counter
                 )
 
-                self.tree_cache = LMCRadixCache(
-                    params=params,
-                    model_config=self.model_config,
-                    tp_size=self.tp_size,
-                    rank=self.tp_rank,
-                    tp_group=self.tp_group,
-                )
-            else:
-                self.tree_cache = RadixCache(params)
+                # self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                # self.tp_worker.register_hicache_layer_transfer_counter(
+                #     self.tree_cache.cache_controller.layer_done_counter
+                # )
+
+            # elif self.is_hybrid_swa:
+            #     from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+            #
+            #     self.tree_cache = SWARadixCache(params=params)
+            # elif self.is_hybrid_ssm:
+            #     from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+            #
+            #     self.tree_cache = MambaRadixCache(params)
+            # elif server_args.enable_lmcache:
+            #     from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+            #         LMCRadixCache,
+            #     )
+            #
+            #     self.tree_cache = LMCRadixCache(
+            #         params=params,
+            #         model_config=self.model_config,
+            #         tp_size=self.tp_size,
+            #         rank=self.tp_rank,
+            #         tp_group=self.tp_group,
+            #     )
+            # else:
+            #     self.tree_cache = RadixCache(params)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -731,7 +741,7 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=params.tp_cache_group,
-                tree_cache=self.tree_cache,
+                tree_cache=self.tree_cache, ## mengyao_debug no need
                 server_args=self.server_args,
             )
         else:
@@ -785,7 +795,8 @@ class Scheduler(
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
-            self.tree_cache,
+            self.tree_cache_hicache,
+            self.tree_cache_fusionrag,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
@@ -900,7 +911,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
-                tree_cache=self.tree_cache,
+                tree_cache=self.tree_cache, # mengyao_debug no need
             )
 
             # The decode requests pending for pre-allocation
@@ -912,7 +923,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
-                tree_cache=self.tree_cache,
+                tree_cache=self.tree_cache, # mengyao_debug no need
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
@@ -1658,7 +1669,10 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                tree_cache_hicache=self.tree_cache_hicache,
+                tree_cache_fusionrag=self.tree_cache_fusionrag,
+            )
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -1666,12 +1680,13 @@ class Scheduler(
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
+                ## only hicache has this.
                 prefix_keys = (
                     req.last_node.get_prefix_hash_values(req.last_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    if self.tree_cache_hicache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                self.tree_cache_hicache.prefetch_from_storage(
                     req.rid,
                     req.last_host_node,
                     new_input_tokens,
@@ -1756,9 +1771,9 @@ class Scheduler(
             if abort_existing_req:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                    self.tree_cache_hicache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
+                    self.tree_cache_hicache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -1788,7 +1803,7 @@ class Scheduler(
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                    self.tree_cache_hicache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -1878,7 +1893,8 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        self.tree_cache_hicache.cache_unfinished_req(req, chunked=True)
+        self.tree_cache_fusionrag.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Tuple[Optional[ScheduleBatch], List[Req]]:
         self._abort_on_waiting_timeout()
@@ -2016,7 +2032,8 @@ class Scheduler(
             return None, []
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            self.tree_cache_hicache.check_hicache_events()
+            self.tree_cache_fusionrag.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2038,7 +2055,8 @@ class Scheduler(
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
-            self.tree_cache,
+            self.tree_cache_hicache,
+            self.tree_cache_fusionrag,
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
@@ -2092,16 +2110,17 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                ##mengyao_debug fusionrag doesn't has storage
+                prefetch_done = self.tree_cache_hicache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                req.storage_hit_length = self.tree_cache_hicache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache_hicache, self.tree_cache_fusionrag)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2158,7 +2177,8 @@ class Scheduler(
             can_run_list,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
-            self.tree_cache,
+            self.tree_cache_hicache,
+            self.tree_cache_fusionrag,
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
@@ -2166,9 +2186,10 @@ class Scheduler(
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
+            new_batch.hicache_consumer_index = [
+                self.tree_cache_hicache.ready_to_load_host_cache(),
+                self.tree_cache_fusionrag.ready_to_load_host_cache(),
+            ]
 
         new_batch.prepare_for_extend()
 

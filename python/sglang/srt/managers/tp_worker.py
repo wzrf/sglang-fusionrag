@@ -304,7 +304,7 @@ class TpModelWorker(BaseTpWorker):
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
-        self.hicache_layer_transfer_counter = None
+        self.hicache_layer_transfer_counter = []
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -385,11 +385,13 @@ class TpModelWorker(BaseTpWorker):
         return self._model_runner
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
-        self.hicache_layer_transfer_counter = counter
+        self.hicache_layer_transfer_counter.append(counter)
 
-    def set_hicache_consumer(self, consumer_index: int):
+    def set_hicache_consumer(self, consumer_indices: list[int]):
         if self.hicache_layer_transfer_counter is not None:
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+            for idx, counter in enumerate(self.hicache_layer_transfer_counter):
+                counter.set_consumer(consumer_indices[idx])
+            # self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
         return (
