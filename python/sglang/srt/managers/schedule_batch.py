@@ -545,7 +545,8 @@ class Req(ReqDllmMixin):
         self.kv_overallocated_freed = False
 
         self.use_chunk_node: bool = False ##mengyao_debug hardcode
-        self.use_mix_prefix_cache: bool = False
+        self.use_mix_prefix_cache: bool = True
+        self.prefix_cache_ids: List[int] = []
         self.hit_chunk_nodes: Any = None
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
@@ -566,6 +567,7 @@ class Req(ReqDllmMixin):
             self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
             self.prefix_prompt_ids_list = fusionrag_params.get("prefix_prompt_ids_list", [])
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
+            self.prefix_cache_ids = fusionrag_params.get("prefix_cache_ids", [])
             #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
             if self.is_kv_gen and self.save_preprocess_cache:
                 self.use_preprocess_cache = False
@@ -948,6 +950,8 @@ class Req(ReqDllmMixin):
                 print(f"req doesn't need to be run.")
                 self.no_need_to_run = True
         else:
+            if len(self.prefix_cache_ids) > 0:
+                token_ids = self.fill_ids[:len(self.prefix_cache_ids)]
             match_result_prefix = tree_cache_hicache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids,
@@ -977,7 +981,7 @@ class Req(ReqDllmMixin):
                 match_result_prefix.host_hit_length,
                 match_result_prefix.mamba_branching_seqlen,
             )
-            self.cache_protected_len = len(self.prefix_indices)
+            self.cache_protected_len = len(self.prefix_indices_hicache)
 
             match_result_fusionrag = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(

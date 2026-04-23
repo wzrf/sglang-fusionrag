@@ -759,6 +759,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else:
                     print(f"mengyao_debug prefix_prompt_list should be in params.")
 
+                prefix_prompt_ = obj.fusionrag_params["prefix_prompt"]
+                prompt_ = input_text
+                if not prompt_.startswith(prefix_prompt_) and prefix_prompt_ in prompt_:
+                    prefix_cache_prompt = prompt_[:prompt_.index(prefix_prompt_)]
+                    prefix_cache_ids, _ = await self._tokenize_texts(
+                        prefix_cache_prompt, is_cross_encoder_request
+                    )
+                    obj.fusionrag_params["prefix_cache_ids"] = prefix_cache_ids
+                else:
+                    obj.fusionrag_params["prefix_cache_ids"] = []
 
                 if "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(

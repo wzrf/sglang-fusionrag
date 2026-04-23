@@ -148,7 +148,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > len(self.free_pages):
             return None
 
-        print(f"[alloc] mengyao_debug free_pages= {self.free_pages}")
+        # print(f"[alloc] mengyao_debug free_pages= {self.free_pages}")
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
@@ -163,7 +163,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
-            print(f"[free] mengyao_debug free_pages= {self.free_pages}")
+            print(f"[free] mengyao_debug free_pages= {len(self.free_pages)}")
         else:
             self.free_group.append(free_index)
 

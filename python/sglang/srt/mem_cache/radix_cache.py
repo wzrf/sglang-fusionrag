@@ -487,6 +487,7 @@ class RadixCache(BasePrefixCache):
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
+            ## mengyao_debug cache_protected_len之前是推理之前前缀匹配出来的，cache_protected_len 到 new_prefix_len是decode出来但是已经在prefix cache里面的；
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
@@ -518,6 +519,12 @@ class RadixCache(BasePrefixCache):
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
+        """
+        这里有点绕，cache_protected_len是指在显存里面的prefix cache，
+        new_prefix_len 是指在trie里面匹配到的在显存里面的prefix cache，
+        cache_protected_len 到 new_prefix_len 这一部分，已经在显存里，所以可以释放掉；
+        之后再通过 match_prefix 函数找到对应释放掉的这部分index，写入req_to_token_pool
+        """
         result = self.insert(
             InsertParams(
                 key=radix_key,

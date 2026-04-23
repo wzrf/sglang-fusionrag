@@ -57,6 +57,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+import json
+from typing import Any
+
+def truncate_strings(obj: Any, max_len: int = 100) -> Any:
+    """递归遍历对象，将字符串值截断到 max_len 个字符"""
+    if isinstance(obj, dict):
+        return {k: truncate_strings(v, max_len) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [truncate_strings(item, max_len) for item in obj]
+    elif isinstance(obj, str):
+        if len(obj) > max_len:
+            return obj[:max_len] + "...(truncated)"
+        return obj
+    else:
+        return obj
+
+def print_request_json(request: Any) -> None:
+    """
+    将 request 对象（可能是 dict、Pydantic 模型或类似结构）转换为 JSON 并打印，
+    所有字符串值仅保留前 100 个字符。
+    """
+    # 支持常见的对象转字典方式
+    if hasattr(request, "model_dump"):      # Pydantic v2
+        data = request.model_dump()
+    elif hasattr(request, "dict"):          # Pydantic v1 / 其他
+        data = request.dict()
+    else:
+        data = request                       # 假定已经是 dict / list
+
+    truncated = truncate_strings(data)
+    print(json.dumps(truncated, indent=2, ensure_ascii=False))
+
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
@@ -242,6 +274,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        print_request_json(request)
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs

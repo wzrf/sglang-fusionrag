@@ -764,16 +764,34 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 if req.use_mix_prefix_cache:
-                    new_indices_hicache, req.last_node = self.tree_cache_hicache.init_load_back(
-                        req.last_host_node, req.host_hit_length_hicache
-                    )
-                    new_indices_fusionrag, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
-                        req.hit_chunk_nodes
-                    )
-                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache, new_indices_fusionrag])
-                    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                    prefix_len = len(req.prefix_indices)
-                    req.cache_protected_len = prefix_len
+                    ## this is a kv gen task, didn't use prefix cache.
+                    if req.last_host_node is None:
+                        new_indices, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
+                            req.hit_chunk_nodes
+                        )
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                        if len(req.prefix_indices) >= len(req.fill_ids):
+                            req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
+                        req.hit_chunk_values = values_list
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+                        req.cache_protected_len = prefix_len
+                    else:
+                        new_indices_hicache, req.last_node = self.tree_cache_hicache.init_load_back(
+                            req.last_host_node, req.host_hit_length_hicache
+                        )
+                        new_indices_fusionrag, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
+                            req.hit_chunk_nodes
+                        )
+                        prefix_indices_hicache = torch.cat([req.prefix_indices, new_indices_hicache])
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache, new_indices_fusionrag])
+                        if len(req.prefix_indices) >= len(req.fill_ids):
+                            req.prefix_indices = req.prefix_indices[:len(req.fill_ids)-1]
+                        req.hit_chunk_values = values_list
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+                        ## 把fusionrag cache视作decode出来的内容，不然这显存部分释放不掉
+                        req.cache_protected_len = len(prefix_indices_hicache)
 
                 else:
                     if not req.use_chunk_node:

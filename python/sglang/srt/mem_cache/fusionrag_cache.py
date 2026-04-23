@@ -793,6 +793,7 @@ class FusionragCache(RadixCache):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
             kv_cache.append(k_buffer)
         kv_cache = torch.stack(kv_cache, dim=0)
+        print(f"[_write_cache_to_disk] kv_cache={kv_cache.shape}, kv_indices_={kv_indices_.shape}, kv_prefix_len={kv_prefix_len}")
         text = req.origin_input_text
         prefix_prompt = req.prefix_prompt
         cache_prefix_token_len = kv_prefix_len
