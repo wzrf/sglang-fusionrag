@@ -899,7 +899,7 @@ class TritonAttnBackend(AttentionBackend):
         #     layer_id = layer.layer_id
         #     if layer_id == 0:
         #         self.global_run_idx += 1
-        #     path = "/mnt/data3/xmy/tests/tmp_save"
+        #     path = "/mnt/data3/shm/tests/tmp_save"
         #     torch.save(
         #         q, f"{path}/q_runid_{self.global_run_idx}_layer_{layer_id}.pt"
         #     )

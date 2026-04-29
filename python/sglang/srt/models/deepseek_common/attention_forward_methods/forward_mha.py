@@ -260,7 +260,7 @@ class DeepseekMHAForwardMixin:
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch) # fixme: set buffer
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}_runidx_{RUN_IDX}.pt"
+            save_path = f"/mnt/data3/shm/fusionrag/debug/_set_mla_kv_buffer_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}_runidx_{RUN_IDX}.pt"
             torch.save(latent_cache, save_path)
 
         def has_duplicates(tensor):
@@ -452,14 +452,14 @@ class DeepseekMHAForwardMixin:
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)
         tp_size = get_tensor_model_parallel_world_size()
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/attn_output_{self.layer_id}_tp_{tp_size}.pt"
+            save_path = f"/mnt/data3/shm/fusionrag/debug/attn_output_{self.layer_id}_tp_{tp_size}.pt"
             torch.save(attn_output, save_path)
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         # print(f"mengyao_debug forward_normal_core attn_output={attn_output[-1][:5]}")
         output, _ = self.o_proj(attn_output)
         if is_extend_and_debug(forward_batch):
-            save_path = f"/mnt/data3/xmy/fusionrag/debug/o_proj_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
+            save_path = f"/mnt/data3/shm/fusionrag/debug/o_proj_{self.layer_id}_tp_{tp_size}_rank_{self.o_proj.tp_rank}.pt"
             torch.save(output, save_path)
         return output
 

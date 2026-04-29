@@ -593,6 +593,26 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         ).flatten()
 
+    def set_from_indices(self, host_indices: torch.Tensor, data_page: torch.Tensor) -> None:
+        if self.layout == "layer_first":
+            self.kv_buffer[:, :, host_indices, :, :] = data_page.reshape(
+                2,
+                self.layer_num,
+                len(host_indices),
+                self.head_num,
+                self.head_dim,
+            )
+        elif self.layout == "page_first":
+            self.kv_buffer[:, host_indices, :, :, :] = data_page.reshape(
+                2,
+                len(host_indices),
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         if self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
