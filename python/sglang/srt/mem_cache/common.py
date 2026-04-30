@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.fusionrag_plan import build_compute_cache_indices
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -22,6 +23,24 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+def _split_recompute_mapping(req, recompute_cache_index: torch.Tensor) -> tuple[list[int], list[int]]:
+    recompute_fill_idx = list(getattr(req, "recompute_fill_idx", None) or [])
+    recompute_n = int(recompute_cache_index.numel())
+    if len(recompute_fill_idx) != recompute_n:
+        logger.warning(
+            "[FusionRAG] recompute_alignment_mismatch: rid=%s recompute_fill=%d recompute_cache=%d",
+            req.rid,
+            len(recompute_fill_idx),
+            recompute_n,
+        )
+
+    n_pair = min(len(recompute_fill_idx), recompute_n)
+    return (
+        [int(pos) for pos in recompute_fill_idx[:n_pair]],
+        [int(cache_idx) for cache_idx in recompute_cache_index[:n_pair].tolist()],
+    )
 
 
 @triton.jit
@@ -114,8 +133,8 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
     compute_positions: list[list[int]] | None = None,
 ):
-    # Triton 快路径只适合连续区间写入（prefix + extend）。
-    # single-pass 场景会给 compute_positions（离散位置），不能直接走连续写。
+    # Triton fast path does contiguous [prefix, extend] writes.
+    # When compute_positions is provided, we need sparse writes and fall back to Python path.
     if compute_positions is None and support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
@@ -138,8 +157,6 @@ def write_cache_indices(
         sparse_req_indices = []
         sparse_positions = []
         sparse_values = []
-        # 有 compute_positions 时优先尝试 sparse Triton；
-        # 若后端不支持 Triton，再退化到逐请求 torch 索引写。
         use_sparse_triton = (
             compute_positions is not None
             and support_triton(get_global_server_args().attention_backend)
@@ -162,8 +179,6 @@ def write_cache_indices(
                 )
             else:
                 if use_sparse_triton:
-                    # 先在 CPU 侧拼平 (req_idx, position, value)，最后一次性发给 Triton kernel，
-                    # 避免每个请求单独触发小 kernel 或频繁高级索引写入。
                     positions_i = compute_positions[i]
                     sparse_req_indices.extend([req_idx] * len(positions_i))
                     sparse_positions.extend(positions_i)
@@ -183,7 +198,6 @@ def write_cache_indices(
             pt += extend_len
 
         if use_sparse_triton and sparse_positions:
-            # 稀疏写入的真实提交点：把离散 token slot 写回 req_to_token 映射表。
             sparse_req_indices_tensor = torch.tensor(
                 sparse_req_indices, dtype=torch.int64, device=req_to_token_pool.device
             )
@@ -437,18 +451,48 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache_hicache.page_size == 1:
-        # out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-        out_cache_loc = torch.tensor([], dtype=torch.int64, device=batch.device)
+        # Build out_cache_loc strictly aligned with compute_positions.
+        # This avoids shape mismatch when recompute overlaps uncached tail positions.
+        out_cache_loc_chunks = []
         for i, req in enumerate(batch.reqs):
-            recompute_cache_index = recompute_cache_indices[i]
-            out_cache_loc_extend = alloc_token_slots(batch.tree_cache_hicache, len(input_ids_only_extend[i]))
-            out_cache_loc = torch.cat(
-                [
-                    out_cache_loc,
-                    recompute_cache_index.to(torch.int64),
-                    out_cache_loc_extend.to(torch.int64),
-                ]
+            req_positions = compute_positions[i]
+            compute_len = len(req_positions)
+            recompute_cache_index = recompute_cache_indices[i].to(torch.int64)
+            recompute_n = int(recompute_cache_index.numel())
+            uncached_n = len(input_ids_only_extend[i])
+            recompute_positions, recompute_cache_values = _split_recompute_mapping(
+                req, recompute_cache_index
             )
+            recompute_pos_set = set(recompute_positions)
+            fresh_n = sum(1 for pos in req_positions if pos not in recompute_pos_set)
+            fresh_slots = alloc_token_slots(batch.tree_cache_hicache, fresh_n).to(torch.int64)
+            req_cache_indices_tensor = torch.tensor(
+                build_compute_cache_indices(
+                    compute_positions=req_positions,
+                    recompute_positions=recompute_positions,
+                    recompute_cache_indices=recompute_cache_values,
+                    fresh_cache_indices=[int(slot) for slot in fresh_slots.tolist()],
+                ),
+                dtype=torch.int64,
+                device=batch.device,
+            )
+            if req_cache_indices_tensor.numel() != compute_len:
+                raise RuntimeError(
+                    f"[FusionRAG] kv_alloc_len_mismatch: rid={req.rid} compute_len={compute_len} alloc_len={req_cache_indices_tensor.numel()}"
+                )
+            out_cache_loc_chunks.append(req_cache_indices_tensor)
+
+            if recompute_n > 0:
+                logger.debug(
+                    "[FusionRAG] kv_alloc_map: rid=%s recompute_n=%d uncached_n=%d compute_len=%d fresh_n=%d",
+                    req.rid,
+                    recompute_n,
+                    uncached_n,
+                    compute_len,
+                    fresh_n,
+                )
+
+        out_cache_loc = torch.cat(out_cache_loc_chunks) if out_cache_loc_chunks else torch.tensor([], dtype=torch.int64, device=batch.device)
 
         write_cache_indices(
             out_cache_loc,
@@ -466,33 +510,70 @@ def alloc_for_extend(
         )
 
     else:
-        # Paged allocation - build last_loc
+        # Paged allocation - allocate only fresh compute slots, then stitch
+        # them back with recompute cache indices in compute_positions order.
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
-        out_cache_loc_extend = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
+        fresh_lens = []
+        recompute_mappings = []
+        for i, req in enumerate(batch.reqs):
+            recompute_positions, recompute_cache_values = _split_recompute_mapping(
+                req, recompute_cache_indices[i].to(torch.int64)
+            )
+            recompute_mappings.append((recompute_positions, recompute_cache_values))
+            recompute_pos_set = set(recompute_positions)
+            fresh_lens.append(
+                sum(1 for pos in compute_positions[i] if pos not in recompute_pos_set)
+            )
+
+        fresh_lens_cpu = torch.tensor(fresh_lens, dtype=torch.int64)
+        fresh_lens_device = fresh_lens_cpu.to(batch.device, non_blocking=True)
+        fresh_seq_lens_cpu = prefix_lens_cpu + fresh_lens_cpu
+        fresh_seq_lens_device = prefix_lens_device + fresh_lens_device
+
+        fresh_out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache_hicache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens=fresh_seq_lens_device,
+            seq_lens_cpu=fresh_seq_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=sum(batch.alloc_extend_lens),
+            extend_num_tokens=sum(fresh_lens),
         )
-        out_cache_loc = torch.tensor([], dtype=torch.int64, device=batch.device)
+        out_cache_loc_chunks = []
         pt = 0
         for i, req in enumerate(batch.reqs):
-            alloc_len = batch.alloc_extend_lens[i]
-            recompute_cache_index = recompute_cache_indices[i].to(torch.int64)
-            out_cache_loc = torch.cat(
-                [
-                    out_cache_loc,
-                    recompute_cache_index,
-                    out_cache_loc_extend[pt : pt + alloc_len].to(torch.int64),
-                ]
+            fresh_n = fresh_lens[i]
+            req_positions = compute_positions[i]
+            fresh_cache_indices = fresh_out_cache_loc[pt : pt + fresh_n].to(torch.int64)
+            recompute_positions, recompute_cache_values = recompute_mappings[i]
+            req_cache_indices_tensor = torch.tensor(
+                build_compute_cache_indices(
+                    compute_positions=req_positions,
+                    recompute_positions=recompute_positions,
+                    recompute_cache_indices=recompute_cache_values,
+                    fresh_cache_indices=[int(slot) for slot in fresh_cache_indices.tolist()],
+                ),
+                dtype=torch.int64,
+                device=batch.device,
             )
-            pt += alloc_len
+            out_cache_loc_chunks.append(req_cache_indices_tensor)
+            pt += fresh_n
+            if len(getattr(req, "recompute_idx", []) or []) > 0:
+                logger.debug(
+                    "[FusionRAG] kv_alloc_map: rid=%s recompute_cache_idx=%s fresh_n=%d out_cache_prefix=%s",
+                    req.rid,
+                    recompute_cache_values[:16],
+                    fresh_n,
+                    req_cache_indices_tensor[:16].tolist(),
+                )
+        out_cache_loc = (
+            torch.cat(out_cache_loc_chunks)
+            if out_cache_loc_chunks
+            else torch.tensor([], dtype=torch.int64, device=batch.device)
+        )
 
         # Write to req_to_token_pool
         write_cache_indices(

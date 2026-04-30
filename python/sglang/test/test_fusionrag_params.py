@@ -1,8 +1,11 @@
+import pytest
+
 from sglang.srt.fusionrag_params import (
     FusionRAGValidationError,
     normalize_fusionrag_params,
 )
 from sglang.srt.fusionrag_plan import (
+    build_compute_cache_indices,
     build_req_to_token_row,
     build_fusionrag_plan,
     compute_extend_logprob_pruned_lens,
@@ -163,7 +166,8 @@ def test_compute_request_local_recompute_indices_with_prefix_and_chunk_hits():
         prefix_indices_len=12,
     )
 
-    assert recompute_idx == [2, 6, 10]
+    # Strict v2 policy drops prefix-space recompute and only keeps chunk-mapped positions.
+    assert recompute_idx == [6, 10]
 
 
 def test_select_prefix_compatible_chunk_hits_stops_on_gap():
@@ -198,6 +202,27 @@ def test_build_req_to_token_row_overwrites_real_compute_positions():
     )
 
     assert row == [100, 101, 202, 103, 104, 305, 306, 307]
+
+
+def test_build_compute_cache_indices_deduplicates_overlap_between_recompute_and_tail():
+    cache_indices = build_compute_cache_indices(
+        compute_positions=[20, 21, 22, 23, 24, 25],
+        recompute_positions=[20, 21, 22],
+        recompute_cache_indices=[920, 921, 922],
+        fresh_cache_indices=[1030, 1031, 1032],
+    )
+
+    assert cache_indices == [920, 921, 922, 1030, 1031, 1032]
+
+
+def test_build_compute_cache_indices_rejects_wrong_fresh_slot_count():
+    with pytest.raises(ValueError, match="fresh cache size mismatch"):
+        build_compute_cache_indices(
+            compute_positions=[5, 6, 7],
+            recompute_positions=[5],
+            recompute_cache_indices=[105],
+            fresh_cache_indices=[206],
+        )
 
 
 def test_disable_recompute_for_return_logprob_downgrades_to_safe_path():

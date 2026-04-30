@@ -467,6 +467,11 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+            extend_all_compute_len = getattr(forward_batch, "extend_all_compute_len", None)
+            if extend_all_compute_len is not None and len(extend_all_compute_len) == len(forward_batch.seq_lens):
+                # Recompute path: query token count equals actual compute stream length
+                # (recompute positions + uncached positions), not raw extend_input_len.
+                prefix_lens = (forward_batch.seq_lens.to(torch.int64) - extend_all_compute_len.to(torch.int64)).clamp(min=0).to(forward_batch.seq_lens.dtype)
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
@@ -480,7 +485,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix = False
             else:
                 use_ragged = not self.enable_deterministic
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                if extend_all_compute_len is not None and len(extend_all_compute_len) == len(forward_batch.seq_lens):
+                    extend_no_prefix = not any(prefix_lens.detach().cpu().tolist())
+                else:
+                    extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()

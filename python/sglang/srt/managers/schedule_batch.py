@@ -53,7 +53,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.fusionrag_plan import (
@@ -559,6 +562,7 @@ class Req(ReqDllmMixin):
         self.hit_chunk_plan: List[Any] = []
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
+        self.recompute_fill_idx: List[int] = []
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
         self.extend_compute_len: int = 0
@@ -571,6 +575,19 @@ class Req(ReqDllmMixin):
             input_ids_len=len(origin_input_ids),
         )
         apply_legacy_fusionrag_fields(self, fusionrag_params, self.fusionrag_plan)
+        if self.fusionrag_plan is not None and getattr(self.fusionrag_plan, "schema_version", None) == 2:
+            logger.debug(
+                "[FusionRAG] req_summary: rid=%s mode=%s input_len=%d chunk_plan=%d recompute_idx=%d use_radix=%s use_chunk=%s save_radix=%s save_chunk=%s",
+                self.rid,
+                self.fusionrag_plan.mode,
+                len(self.origin_input_ids),
+                len(self.fusionrag_plan.chunk_plan),
+                len(getattr(self.fusionrag_plan, "recompute_token_idx", []) or []),
+                self.fusionrag_plan.cache_policy.get("use_radix_cache", True),
+                self.fusionrag_plan.cache_policy.get("use_chunk_cache", True),
+                self.fusionrag_plan.cache_policy.get("save_to_radix_cache", True),
+                self.fusionrag_plan.cache_policy.get("save_to_chunk_cache", False),
+            )
         # shm debug
         # self.is_kv_gen = True
 
@@ -925,6 +942,16 @@ class Req(ReqDllmMixin):
 
         ## if it's kv gen, only use fusion rag cache.
         if self.is_kv_gen:
+            if tree_cache_fusionrag is None:
+                self.hit_chunk_nodes = []
+                self.hit_chunk_plan = []
+                self.host_hit_length_hicache = 0
+                self.host_hit_length_fusionrag = 0
+                self.host_hit_length = 0
+                self.prefix_indices = torch.empty(
+                    (0,), dtype=torch.int64, device="cpu"
+                )
+                return
             match_result = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids,
@@ -947,7 +974,7 @@ class Req(ReqDllmMixin):
             self.host_hit_length = match_result.host_hit_length
             self.prefix_indices = match_result.device_indices  ## empty
             if match_result.no_need_to_run:
-                print(f"req doesn't need to be run.")
+                logger.info("[FusionRAG] kv_gen skip run: rid=%s reason=target_exists", self.rid)
                 self.no_need_to_run = True
         else:
             if len(self.prefix_cache_ids) > 0:
@@ -1310,6 +1337,26 @@ class Req(ReqDllmMixin):
             prefix_indices_len=len(self.prefix_indices),
             fallback_recompute_idx=self.recompute_idx,
         )
+        # recompute_idx is prefix-space index for cache row lookup;
+        # recompute_fill_idx is fill_ids/global position used by model positions and token gather.
+        recompute_fill_idx = set()
+        plan = self.fusionrag_plan
+        if plan is not None and getattr(plan, "schema_version", None) == 2:
+            hit_token_lens = [len(chunk_node.host_value) for chunk_node in (self.hit_chunk_nodes or [])]
+            for chunk_plan, loaded_len in zip(self.hit_chunk_plan or [], hit_token_lens):
+                span_start = int(chunk_plan.start_token)
+                span_end = span_start + int(loaded_len)
+                for global_idx in (plan.recompute_token_idx or []):
+                    if span_start <= global_idx < span_end:
+                        recompute_fill_idx.add(int(global_idx))
+                for local_idx in (chunk_plan.recompute_token_idx_local or []):
+                    g = span_start + int(local_idx)
+                    if span_start <= g < span_end:
+                        recompute_fill_idx.add(g)
+        else:
+            recompute_fill_idx = set(int(idx) for idx in (self.recompute_idx or []))
+        fill_upper = len(self.fill_ids)
+        self.recompute_fill_idx = sorted(idx for idx in recompute_fill_idx if 0 <= idx < fill_upper)
         self.apply_fusionrag_runtime_guards()
 
     def apply_fusionrag_runtime_guards(self):
@@ -1320,8 +1367,22 @@ class Req(ReqDllmMixin):
             extend_logprob_start_len=self.extend_logprob_start_len,
         )
         self.recompute_idx = recompute_idx
+        if not self.recompute_idx:
+            self.recompute_fill_idx = []
         if fallback_reason and self.fusionrag_fallback_reason is None:
             self.fusionrag_fallback_reason = fallback_reason
+
+        if self.recompute_idx:
+            upper_bound = len(self.prefix_indices)
+            invalid = [idx for idx in self.recompute_idx if idx < 0 or idx >= upper_bound]
+            if invalid:
+                logger.warning(
+                    "[FusionRAG] recompute_idx_oob: rid=%s invalid=%s prefix_indices_len=%d fallback=%s",
+                    self.rid,
+                    invalid[:16],
+                    upper_bound,
+                    self.fusionrag_fallback_reason or "",
+                )
 
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
@@ -1641,7 +1702,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for r in reqs:
             r.apply_fusionrag_runtime_guards()
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
-            r.all_compute_idx = copy.deepcopy(r.recompute_idx)
+            recompute_fill_idx = (getattr(r, "recompute_fill_idx", None) or r.recompute_idx) if r.recompute_idx else []
+            r.all_compute_idx = copy.deepcopy(recompute_fill_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
             r.all_compute_idx.extend(extend_compute_idx)
             r.all_compute_idx = sorted(set(r.all_compute_idx))
@@ -1649,6 +1711,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             compute_positions.append(r.all_compute_idx)
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
+            logger.debug(
+                "[FusionRAG] extend_shape: rid=%s prefix_len=%d fill_len=%d extend_input_len=%d extend_compute_len=%d recompute_n=%d",
+                r.rid,
+                len(r.prefix_indices),
+                len(r.fill_ids),
+                r.extend_input_len,
+                r.extend_compute_len,
+                len(r.recompute_idx),
+            )
+            if r.recompute_idx:
+                logger.debug(
+                    "[FusionRAG] recompute_map: rid=%s prefix_len=%d fill_len=%d recompute_idx=%s all_compute_idx=%s",
+                    r.rid,
+                    len(r.prefix_indices),
+                    len(r.fill_ids),
+                    (getattr(r, "recompute_fill_idx", None) or r.recompute_idx)[:16],
+                    r.all_compute_idx[:32],
+                )
 
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]

@@ -1046,8 +1046,10 @@ def compute_position_with_recompute_indices(
     positions = torch.cat(seq_list, dim=0)
     seq_list_compute_len = torch.tensor(seq_list_compute_len).to(extend_prefix_lens.device).to(torch.int64)
 
-    extend_start_loc = torch.zeros_like(extend_seq_lens)
-    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+    # IMPORTANT: extend_start_loc must align with flattened compute tokens
+    # (recompute positions + uncached positions), not extend_input_len.
+    extend_start_loc = torch.zeros_like(seq_list_compute_len)
+    extend_start_loc[1:] = torch.cumsum(seq_list_compute_len[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc, seq_list_compute_len
 
 

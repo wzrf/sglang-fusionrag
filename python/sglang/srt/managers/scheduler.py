@@ -2073,7 +2073,9 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_round_input(
+                self.tree_cache_hicache, self.tree_cache_fusionrag
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.fusionrag_params import normalize_fusionrag_params
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -213,10 +216,12 @@ def compute_request_local_recompute_indices(
             idx for idx in (fallback_recompute_idx or []) if idx < prefix_indices_len
         )
 
+    # Strict policy:
+    # 1) recompute must be mapped from chunk hits;
+    # 2) recompute is never allowed in radix-prefix area [0, prefix_hicache_len).
     local_recompute = set()
-    for global_idx in plan.recompute_token_idx:
-        if global_idx < prefix_hicache_len:
-            local_recompute.add(global_idx)
+    mapped_global_recompute = set()
+    dropped_prefix_global = []
 
     fusionrag_offset = prefix_hicache_len
     for chunk_plan, loaded_len in zip(hit_chunk_plans, hit_chunk_token_lens):
@@ -225,14 +230,42 @@ def compute_request_local_recompute_indices(
 
         for global_idx in plan.recompute_token_idx:
             if span_start <= global_idx < span_end:
+                if global_idx < prefix_hicache_len:
+                    dropped_prefix_global.append(global_idx)
+                    continue
                 local_recompute.add(fusionrag_offset + (global_idx - span_start))
+                mapped_global_recompute.add(global_idx)
 
         for local_idx in chunk_plan.recompute_token_idx_local:
             if 0 <= local_idx < loaded_len:
+                global_idx = span_start + local_idx
+                if global_idx < prefix_hicache_len:
+                    dropped_prefix_global.append(global_idx)
+                    continue
                 local_recompute.add(fusionrag_offset + local_idx)
 
         fusionrag_offset += loaded_len
 
+    if dropped_prefix_global:
+        dropped_prefix_global = sorted(set(dropped_prefix_global))
+        logger.debug(
+            "[FusionRAG] drop_prefix_recompute_idx_strict: count=%d sample=%s prefix_hicache_len=%d",
+            len(dropped_prefix_global),
+            dropped_prefix_global[:16],
+            prefix_hicache_len,
+        )
+
+    dropped_unmapped = [idx for idx in plan.recompute_token_idx if idx not in mapped_global_recompute]
+    if dropped_unmapped:
+        logger.debug(
+            "[FusionRAG] drop_unmapped_recompute_idx: count=%d sample=%s prefix_hicache_len=%d chunk_hits=%d",
+            len(dropped_unmapped),
+            dropped_unmapped[:16],
+            prefix_hicache_len,
+            len(hit_chunk_plans),
+        )
+
+    # No prefix-space fallback here by design.
     return sorted(idx for idx in local_recompute if idx < prefix_indices_len)
 
 
@@ -319,3 +352,38 @@ def build_req_to_token_row(
         row[position] = cache_index
 
     return row
+
+
+def build_compute_cache_indices(
+    *,
+    compute_positions: List[int],
+    recompute_positions: List[int],
+    recompute_cache_indices: List[int],
+    fresh_cache_indices: List[int],
+) -> List[int]:
+    if len(recompute_positions) != len(recompute_cache_indices):
+        raise ValueError("recompute positions and cache indices must have the same length")
+
+    recompute_pos_to_cache: Dict[int, int] = {}
+    for position, cache_index in zip(recompute_positions, recompute_cache_indices):
+        previous = recompute_pos_to_cache.get(position)
+        if previous is not None and previous != cache_index:
+            raise ValueError(f"conflicting recompute cache index for position {position}")
+        recompute_pos_to_cache[position] = cache_index
+
+    fresh_needed = sum(1 for position in compute_positions if position not in recompute_pos_to_cache)
+    if fresh_needed != len(fresh_cache_indices):
+        raise ValueError(
+            f"fresh cache size mismatch: expected {fresh_needed}, got {len(fresh_cache_indices)}"
+        )
+
+    ordered_cache_indices: List[int] = []
+    fresh_pt = 0
+    for position in compute_positions:
+        cache_index = recompute_pos_to_cache.get(position)
+        if cache_index is None:
+            cache_index = fresh_cache_indices[fresh_pt]
+            fresh_pt += 1
+        ordered_cache_indices.append(cache_index)
+
+    return ordered_cache_indices

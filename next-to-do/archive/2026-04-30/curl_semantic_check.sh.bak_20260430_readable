@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${BASE_URL:-http://127.0.0.1:30004}"
+LOG_FILE="${LOG_FILE:-/mnt/data/shm/sglang-fusionrag-fusionrag_unified_pipeline/sg_e2e_30004.log}"
+MODEL_PATH="${MODEL_PATH:-/mnt/data/models/Qwen2.5-0.5B-Instruct}"
+
+say(){ echo; echo "== $* =="; }
+fail(){ echo "FAIL: $*" >&2; exit 1; }
+
+say "Health"
+curl -sS "$BASE_URL/model_info" >/dev/null || fail "service not ready at $BASE_URL"
+
+TEXT="prefixZ::Document A says Paris is in France. tail tokens for generation"
+DOC="Document A says Paris is in France."
+
+say "1) no-fusion baseline"
+R0=$(curl -sS "$BASE_URL/generate" -H 'content-type: application/json' -d "{\"text\":\"$TEXT\",\"sampling_params\":{\"temperature\":0,\"max_new_tokens\":32}}")
+echo "$R0" | head -c 240; echo
+
+DOC_TOKENS=$(python3 - <<PY
+from transformers import AutoTokenizer
+t=AutoTokenizer.from_pretrained('$MODEL_PATH', trust_remote_code=True)
+print(len(t.encode('$DOC', add_special_tokens=False)))
+PY
+)
+
+say "2) kv_gen raw save"
+R1=$(curl -sS "$BASE_URL/generate" -H 'content-type: application/json' -d "{\"text\":\"$DOC\",\"sampling_params\":{\"temperature\":0,\"max_new_tokens\":0},\"fusionrag_params\":{\"enable\":true,\"mode\":\"kv_gen\",\"cache_policy\":{\"use_radix_cache\":false,\"use_chunk_cache\":false,\"save_to_radix_cache\":false,\"save_to_chunk_cache\":true},\"chunk_plan\":[{\"doc_id\":\"doc_demo\",\"chunk_id\":\"doc_demo_c0\",\"doc_text\":\"$DOC\",\"cache_variant\":\"raw\",\"start_token\":0,\"end_token\":$DOC_TOKENS,\"use_preprocess_cache\":false,\"recompute_token_idx_local\":[]}],\"kv_gen\":{\"target_doc_id\":\"doc_demo\",\"target_chunk_id\":\"doc_demo_c0\",\"save_variants\":[\"raw\"],\"strip_prefix\":false}}}")
+echo "$R1" | head -c 240; echo
+
+say "3) fusion generate with chunk_plan + recompute"
+P=$(python3 - <<PY
+from transformers import AutoTokenizer
+t=AutoTokenizer.from_pretrained('$MODEL_PATH', trust_remote_code=True)
+print(len(t.encode('prefixZ::', add_special_tokens=False)))
+PY
+)
+E=$((P+DOC_TOKENS))
+R2=$(curl -sS "$BASE_URL/generate" -H 'content-type: application/json' -d "{\"text\":\"$TEXT\",\"sampling_params\":{\"temperature\":0,\"max_new_tokens\":32},\"fusionrag_params\":{\"enable\":true,\"mode\":\"generate\",\"cache_policy\":{\"use_radix_cache\":true,\"use_chunk_cache\":true,\"save_to_radix_cache\":true,\"save_to_chunk_cache\":false},\"chunk_plan\":[{\"doc_id\":\"doc_demo\",\"chunk_id\":\"doc_demo_c0\",\"doc_text\":\"$DOC\",\"cache_variant\":\"raw\",\"start_token\":$P,\"end_token\":$E,\"use_preprocess_cache\":false,\"recompute_token_idx_local\":[0,2]}],\"recompute_token_idx\":[$P,$((P+1))]}}")
+echo "$R2" | head -c 320; echo
+
+say "4) print meta_info"
+python3 - <<PY
+import json
+r=json.loads('''$R2''')
+mi=r.get('meta_info',{})
+keys=['fusionrag_chunk_hit_tokens','fusionrag_recompute_tokens','fusionrag_compute_tokens','fusionrag_prefill_tokens','fusionrag_chunk_lookup_hits','fusionrag_chunk_lookup_misses','fusionrag_fallback_reason']
+for k in keys:
+    print(k, mi.get(k))
+PY
+
+say "4.1) assert chunk hit"
+python3 - <<PY
+import json, sys
+r=json.loads('''$R2''')
+mi=r.get('meta_info',{})
+hits=mi.get('fusionrag_chunk_lookup_hits',[0])
+if isinstance(hits,list):
+    hits=hits[0] if hits else 0
+try:
+    hits=int(hits)
+except Exception:
+    hits=0
+if hits < 1:
+    print('FAIL: expected fusionrag_chunk_lookup_hits>=1, got', hits)
+    sys.exit(2)
+print('PASS: fusionrag_chunk_lookup_hits=', hits)
+PY
+
+say "5) log snippets"
+rg -n "\[FusionRAG\] req_summary|\[FusionRAG\] cache_save|\[FusionRAG\] chunk_plan_partial_miss|fusionrag_prefill_compute|recompute_idx_oob" "$LOG_FILE" | tail -n 120 || true
+
+say "done"

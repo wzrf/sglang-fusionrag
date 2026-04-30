@@ -561,9 +561,10 @@ class FusionragCache(RadixCache):
 
     ##fixme: evict的数据不需要存储到host，会污染kvcache
     def evict(self, num_tokens: int):
-        print(f"we need to evict {num_tokens} tokens")
-        raise f"panic! not enough memories!"
-        ""
+        raise RuntimeError(
+            "[FusionRAG] panic! not enough memories during chunk-cache load-back "
+            f"(requested_tokens={num_tokens}, evictable_size={self.evictable_size()})"
+        )
 
     def _evict_backuped(self, node: ChunkNode):
         ""
@@ -588,13 +589,20 @@ class FusionragCache(RadixCache):
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            print(f"not enough HBM to load")
+            logger.warning(
+                "[FusionRAG] load_back_hbm_exhausted: node_id=%s tokens=%d",
+                last_hit_node.id,
+                len(host_indices),
+            )
             self.evict(len(host_indices))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
         if device_indices is None:
-            raise Exception(f"not enough HBM to load")
+            raise RuntimeError(
+                "[FusionRAG] not enough HBM to load chunk cache "
+                f"(node_id={last_hit_node.id}, tokens={len(host_indices)})"
+            )
             # no sufficient GPU memory to load back KV caches
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
@@ -644,9 +652,12 @@ class FusionragCache(RadixCache):
                     prefix_text = params.key.prefix_prompt_text
                     text_without_prefix = params.key.origin_input_text[len(prefix_text):]
                     if text_without_prefix == node.text_without_prefix:
-                        print(f"kv gen already run before\ntext={text_without_prefix}\n"
-                              f"prefix={prefix_text}\n"
-                              f"is_preprocess_cache={node.is_preprocess_cache}")
+                        logger.debug(
+                            "[FusionRAG] kv_gen_target_exists: preprocess=%s text_len=%d prefix_len=%d",
+                            node.is_preprocess_cache,
+                            len(text_without_prefix),
+                            len(prefix_text),
+                        )
                         return MatchResult(
                             device_indices=torch.empty(
                                 (0,),
@@ -664,27 +675,42 @@ class FusionragCache(RadixCache):
         input_text = str(copy.deepcopy(params.key.prefix_prompt_text))
         last_round_found = True
         if len(input_text) == 0:
-            print(f"mengyao_debug fusionrag cache match_prefix skipping prefix.")
+            logger.debug("[FusionRAG] match_prefix_skip_empty_prefix")
         ##
         match_idx = 0
         if params.key.use_preprocess_kv_cache == True:
-            print(f"use preprocess cache") ## for debug
+            logger.debug("[FusionRAG] match_prefix_use_preprocess_cache")
         while len(input_text) > 0 and last_round_found:
             last_round_found = False
             for node in self.all_nodes:
                 ## 找到和preprocess/raw 匹配的nodes
                 if node.is_preprocess_cache == params.key.use_preprocess_kv_cache:
                     if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
-                        print(f"load text: {node.text_without_prefix[:20]}, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
+                        logger.debug(
+                            "[FusionRAG] match_prefix_hit: text_prefix=%s preprocess=%s save_kv_cache=%s",
+                            node.text_without_prefix[:20],
+                            node.is_preprocess_cache,
+                            params.key.is_kv_gen,
+                        )
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
-                        print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
-                        print(f"host_value={len(node.host_value)}")
+                        logger.debug(
+                            "[FusionRAG] match_prefix_hit_meta: text_ids=%d host_value=%d",
+                            len(node.text_without_prefix_ids),
+                            len(node.host_value),
+                        )
                         try:
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
-                        except Exception as e:
-                            print(f"match_idx={match_idx}")
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
+                            logger.debug(
+                                "[FusionRAG] match_prefix_prompt_ids: match_idx=%d prompt_ids=%d",
+                                match_idx,
+                                len(params.key.prefix_prompt_ids_list[match_idx]),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[FusionRAG] match_prefix_prompt_ids_fallback: match_idx=%d prompt_list_len=%d",
+                                match_idx,
+                                len(params.key.prefix_prompt_ids_list),
+                            )
                         input_text = input_text[len(node.text_without_prefix) :]
                         last_round_found = True
                         break
@@ -943,16 +969,16 @@ class FusionragCache(RadixCache):
         return self.cache_controller.start_loading()
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        print(f"cache_unfinished_req")
+        logger.debug("[FusionRAG] cache_unfinished_req: rid=%s chunked=%s", req.rid, chunked)
         ""
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         save_variants = self._get_save_variants(req)
         if req.is_kv_gen and "preprocess" in save_variants:
-            print(f"save preprocess cache") ## for debug
+            logger.debug("[FusionRAG] save_preprocess_cache: rid=%s", req.rid)
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
-        logger.error(
+        logger.debug(
             f"fusionrag cache_finished_req: rid={req.rid} "
             f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
             f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run}"
@@ -994,10 +1020,12 @@ class FusionragCache(RadixCache):
             )
 
             text_without_prefix_ids = token_ids[span_start:span_end]
-            print(
-                f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
-                f"values={len(values)}\n"
-                f"kv_span=[{span_start}, {span_end})\n"
+            logger.debug(
+                "[FusionRAG] saving_to_cache: text_without_prefix_ids=%d values=%d kv_span=[%d, %d)",
+                len(text_without_prefix_ids),
+                len(values),
+                span_start,
+                span_end,
             )
 
             for variant in save_variants:
@@ -1040,7 +1068,7 @@ class FusionragCache(RadixCache):
                         del node.values[value_idx]
                         break
             except Exception as E:
-                print(f"cache finish req error. E={E}, node={node}")
+                logger.warning("cache finish req error. E=%s, node=%s", E, node)
 
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
@@ -1089,7 +1117,13 @@ class FusionragCache(RadixCache):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
             kv_cache.append(k_buffer)
         kv_cache = torch.stack(kv_cache, dim=0)
-        print(f"[_write_cache_to_disk] kv_cache={kv_cache.shape}, kv_indices_={kv_indices_.shape}, kv_prefix_len={kv_prefix_len}")
+        logger.debug(
+            "[FusionRAG] write_cache_to_disk: kv_cache=%s kv_indices=%s kv_prefix_len=%d variant=%s",
+            tuple(kv_cache.shape),
+            tuple(kv_indices_.shape),
+            kv_prefix_len,
+            variant,
+        )
         text = req.origin_input_text or ""
         prefix_prompt = req.prefix_prompt or ""
         cache_prefix_token_len = kv_prefix_len

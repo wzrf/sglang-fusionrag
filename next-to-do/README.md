@@ -13,8 +13,7 @@
 
 ## 运行
 - sa1 一键跑（轻量服务场景）：`run_demo_sa1.sh`
-- 隔离启动日志中已判定不兼容的缓存条目：
-  `quarantine_incompatible_cache.sh /mnt/data/shm/sglang-fusionrag-fusionrag_unified_pipeline/sg_e2e_05b.log`
 
 ## 历史材料
 - `_archive/`：旧 handoff/过程文档（默认不需要看）
+
