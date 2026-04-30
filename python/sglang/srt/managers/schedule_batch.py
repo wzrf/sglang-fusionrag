@@ -1342,8 +1342,11 @@ class Req(ReqDllmMixin):
         chunk_hit_tokens = self.host_hit_length_fusionrag
         radix_hit_tokens = self.host_hit_length_hicache
         recompute_tokens = len(self.recompute_idx)
+        # compute_tokens 表示本次真正参与前向计算的位置数（single-pass 核心观测口径）。
         compute_tokens = len(self.all_compute_idx)
         prefill_tokens = max(
+            # prefill_tokens 是“本次请求总 token - 各类 cache hit token”，
+            # 用于反映缓存覆盖后仍需 prefill 的 token 规模。
             0, len(self.fill_ids) - int(radix_hit_tokens) - int(chunk_hit_tokens)
         )
         fallback_reason = self.fusionrag_fallback_reason or ""

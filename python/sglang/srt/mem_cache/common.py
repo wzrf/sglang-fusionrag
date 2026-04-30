@@ -114,8 +114,8 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
     compute_positions: list[list[int]] | None = None,
 ):
-    # Triton fast path does contiguous [prefix, extend] writes.
-    # When compute_positions is provided, we need sparse writes and fall back to Python path.
+    # Triton 快路径只适合连续区间写入（prefix + extend）。
+    # single-pass 场景会给 compute_positions（离散位置），不能直接走连续写。
     if compute_positions is None and support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
@@ -138,6 +138,8 @@ def write_cache_indices(
         sparse_req_indices = []
         sparse_positions = []
         sparse_values = []
+        # 有 compute_positions 时优先尝试 sparse Triton；
+        # 若后端不支持 Triton，再退化到逐请求 torch 索引写。
         use_sparse_triton = (
             compute_positions is not None
             and support_triton(get_global_server_args().attention_backend)
@@ -160,6 +162,8 @@ def write_cache_indices(
                 )
             else:
                 if use_sparse_triton:
+                    # 先在 CPU 侧拼平 (req_idx, position, value)，最后一次性发给 Triton kernel，
+                    # 避免每个请求单独触发小 kernel 或频繁高级索引写入。
                     positions_i = compute_positions[i]
                     sparse_req_indices.extend([req_idx] * len(positions_i))
                     sparse_positions.extend(positions_i)
@@ -179,6 +183,7 @@ def write_cache_indices(
             pt += extend_len
 
         if use_sparse_triton and sparse_positions:
+            # 稀疏写入的真实提交点：把离散 token slot 写回 req_to_token 映射表。
             sparse_req_indices_tensor = torch.tensor(
                 sparse_req_indices, dtype=torch.int64, device=req_to_token_pool.device
             )

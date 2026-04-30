@@ -266,6 +266,8 @@ class FusionragCache(RadixCache):
             if os.path.isdir(folder_path):
                 metadata_path = os.path.join(folder_path, "metadata.json")
                 ready_path = os.path.join(folder_path, _CACHE_READY_SENTINEL)
+                # 只有 metadata + ready 同时存在，才认为该目录是“完整提交”的缓存条目。
+                # 这样可规避构建/读取并发时看到半成品文件。
                 if os.path.exists(metadata_path) and os.path.exists(ready_path):
                     try:
                         with open(metadata_path, 'r', encoding='utf-8') as f:
@@ -1146,7 +1148,11 @@ class FusionragCache(RadixCache):
         tensor_file_path = f"{passage_kv_path}/{md5_hash}.pt"
         tmp_tensor_file_path = f"{tensor_file_path}.tmp"
 
-        # clear stale readiness marker before writing new cache artifacts.
+        # 两阶段提交：
+        # 1) 先删除旧 ready，写入 tmp 文件；
+        # 2) 再用 os.replace 原子替换正式文件；
+        # 3) 最后写 ready，表示可被加载。
+        # 读取方只认 ready，从而避免读到部分写入结果。
         if os.path.exists(ready_path):
             os.remove(ready_path)
         with open(tmp_metadata_path, 'w') as f:
