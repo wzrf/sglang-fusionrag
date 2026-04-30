@@ -2903,6 +2903,10 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        # 对 KV-Gen 保存路径：在请求完成前把 chunk KV 的 RoPE 统一旋到局部 0 基准。
+        # 后续落盘读取 req_to_token_pool 时即可直接得到“以 0 为起点”的 chunk KV。
+        self.normalize_kv_gen_cache_rope_to_zero(forward_batch)
+
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
@@ -3017,6 +3021,86 @@ class DeepseekV2Model(nn.Module):
                             k,
                             k_rope,
                         )
+
+    def normalize_kv_gen_cache_rope_to_zero(self, forward_batch):
+        """Normalize KV-Gen chunk KV RoPE positions to local-zero before cache persistence.
+
+        Save-time convention:
+        - chunk KV is stored as local span [0, chunk_len).
+        - for a chunk planned at [start_token, end_token), convert key RoPE from
+          global positions -> local positions (pos - start_token).
+        """
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        reqs = getattr(forward_batch, "reqs", None)
+        if not reqs:
+            return
+        if forward_batch.out_cache_loc is None or forward_batch.positions is None:
+            return
+        if forward_batch.extend_all_compute_len is None:
+            return
+
+        cursor = 0
+        compute_lens = forward_batch.extend_all_compute_len.tolist()
+        for req, compute_len in zip(reqs, compute_lens):
+            next_cursor = cursor + int(compute_len)
+            if not getattr(req, "is_kv_gen", False) or compute_len <= 0:
+                cursor = next_cursor
+                continue
+
+            plan = getattr(req, "fusionrag_plan", None)
+            span_start = 0
+            span_end = len(getattr(req, "origin_input_ids", []) or [])
+            if (
+                plan is not None
+                and getattr(plan, "schema_version", None) == 2
+                and getattr(plan, "chunk_plan", None)
+                and isinstance(getattr(plan, "kv_gen", None), dict)
+            ):
+                kv_gen = plan.kv_gen
+                target_doc_id = kv_gen.get("target_doc_id")
+                target_chunk_id = kv_gen.get("target_chunk_id")
+                for chunk in plan.chunk_plan:
+                    if target_chunk_id is not None and chunk.chunk_id != target_chunk_id:
+                        continue
+                    if target_doc_id is not None and chunk.doc_id != target_doc_id:
+                        continue
+                    span_start = int(chunk.start_token)
+                    span_end = int(chunk.end_token)
+                    break
+
+            positions_slice = forward_batch.positions[cursor:next_cursor].to(torch.int64)
+            cache_indices_slice = forward_batch.out_cache_loc[cursor:next_cursor].to(torch.int64)
+            in_span_mask = (positions_slice >= span_start) & (positions_slice < span_end)
+            if not torch.any(in_span_mask):
+                cursor = next_cursor
+                continue
+
+            selected_positions = positions_slice[in_span_mask]
+            selected_indices = cache_indices_slice[in_span_mask]
+            wrong_positions = selected_positions
+            correct_positions = selected_positions - int(span_start)
+
+            for layer_id in range(len(self.layers)):
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[
+                    selected_indices, :, :
+                ]
+                k = k_buffer[:, :, :512]
+                k_rope = k_buffer[:, :, 512:]
+                layer = self.layers[layer_id]
+                k_rope = correct_rope_rotation(
+                    k_rope,
+                    layer.self_attn.rotary_emb.cos_sin_cache,
+                    wrong_positions=wrong_positions,
+                    correct_positions=correct_positions,
+                )
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer.self_attn.attn_mha,
+                    selected_indices,
+                    k,
+                    k_rope,
+                )
+            cursor = next_cursor
 
     def find_recompute_idx(
         self,
