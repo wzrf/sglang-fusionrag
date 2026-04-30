@@ -1,19 +1,14 @@
-# next-to-do 稳定入口
+# next-to-do
 
-这目录里历史材料较多，后续接手建议只以本 README 列出的“稳定文档”为准。
+这目录现在只保留两个稳定入口：
+- `full.md`：原始需求说明，单独保留，不和状态混写。
+- `HANDOFF.md`：当前交接、状态、风险、下一步。
 
-## 稳定文档（按阅读顺序）
-1. `full.md`：唯一权威需求与接口定义（source of truth）
-2. `develop.md`：工程落地说明（执行注意事项）
-3. `dev_plan.md`：阶段计划与门禁（DoD）
-4. `demo.md`：可执行验收用例（A~D/E）
-5. `STATUS_2026-04-30.md`：当前完成情况与已知风险
-6. `HANDOFF_NEXT.md`：交接摘要（怎么跑/缺什么）
-7. `NEXT_PLAN.md`：下一步 TODO（DONE/PARTIAL/TODO）
+其余仍长期有效的材料：
+- `develop.md`：工程实现说明。
+- `dev_plan.md`：阶段计划与门禁。
+- `demo.md`：验收用例与观测指标。
+- `active/`：当前仍在使用的脚本。
+- `archive/`：历史 handoff/status/todo 与旧版本备份。
 
-## 运行
-- sa1 一键跑（轻量服务场景）：`run_demo_sa1.sh`
-
-## 历史材料
-- `_archive/`：旧 handoff/过程文档（默认不需要看）
-
+建议阅读顺序：`full.md -> develop.md -> dev_plan.md -> demo.md -> HANDOFF.md`
