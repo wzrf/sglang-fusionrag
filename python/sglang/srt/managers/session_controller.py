@@ -147,6 +147,7 @@ class Session:
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,
+            logprob_start_len=req.logprob_start_len,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=vocab_size,

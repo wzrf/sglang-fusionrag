@@ -111,6 +111,7 @@ class MatchResult(NamedTuple):
     kv_cache_gen_prefix_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     all_hit_chunk_nodes: Any = None
+    matched_chunk_plan: Any = None
     no_need_to_run: bool = False
 
 

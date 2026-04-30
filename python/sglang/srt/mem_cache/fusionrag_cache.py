@@ -44,6 +44,13 @@ from sglang.srt.mem_cache.evict_policy import (
 from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+_CACHE_READY_SENTINEL = ".ready"
+
+
+def _chunk_node_sort_len(node: "ChunkNode") -> int:
+    if node.text_without_prefix_ids:
+        return len(node.text_without_prefix_ids)
+    return len(node.text_without_prefix)
 
 class HitCacheNode:
     def __init__(
@@ -71,6 +78,10 @@ class ChunkNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        self.doc_id: Optional[str] = None
+        self.chunk_id: Optional[str] = None
+        self.doc_hash: Optional[str] = None
+        self.chunk_token_len: Optional[int] = None
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0 ##fixme: 按理说不需要，因为永远不会被从host释放
@@ -233,11 +244,11 @@ class FusionragCache(RadixCache):
         served_model_name = server_args.served_model_name
         if not os.path.exists(cache_path_root):
             cache_path_root = "/mnt/data"
-        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache/v2"
+        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache/v2"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache/v2"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache/v2"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -254,7 +265,8 @@ class FusionragCache(RadixCache):
             folder_path = os.path.join(cache_path, folder) ## folder is the md5
             if os.path.isdir(folder_path):
                 metadata_path = os.path.join(folder_path, "metadata.json")
-                if os.path.exists(metadata_path):
+                ready_path = os.path.join(folder_path, _CACHE_READY_SENTINEL)
+                if os.path.exists(metadata_path) and os.path.exists(ready_path):
                     try:
                         with open(metadata_path, 'r', encoding='utf-8') as f:
                             metadata = json.load(f)
@@ -262,17 +274,36 @@ class FusionragCache(RadixCache):
                         cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
                         prefix_text = metadata.get("prefix_text", "")
                         text_without_prefix_ids = metadata.get("text_without_prefix_ids", "")
+                        doc_id = metadata.get("doc_id")
+                        chunk_id = metadata.get("chunk_id")
+                        doc_hash = metadata.get("doc_hash")
+                        chunk_token_len = metadata.get("chunk_token_len")
+                        tensor_path = os.path.join(folder_path, f"{folder}.pt")
+                        if not os.path.exists(tensor_path):
+                            logger.warning(
+                                "[FusionRAG] skip cache folder without tensor: %s",
+                                folder_path,
+                            )
+                            continue
                         result.append(
                             (text_without_prefix,
-                             os.path.join(folder_path, f"{folder}.pt"),
+                             tensor_path,
                              cache_prefix_token_len,
                              prefix_text,
                              use_preprocess_cache,
-                             text_without_prefix_ids)
+                             text_without_prefix_ids,
+                             doc_id,
+                             chunk_id,
+                             doc_hash,
+                             chunk_token_len)
                         )
 
                     except (json.JSONDecodeError, KeyError) as e:
-                        print(f"Error reading {metadata_path}: {e}")
+                        logger.warning(
+                            "[FusionRAG] skip cache folder with invalid metadata: path=%s error=%s",
+                            metadata_path,
+                            e,
+                        )
 
         return result
 
@@ -289,15 +320,31 @@ class FusionragCache(RadixCache):
             prefix_text = all_chunk_cache[3]
             is_preprocess_cache = all_chunk_cache[4]
             text_without_prefix_ids = all_chunk_cache[5]
-            chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
-            prefetch_length = chunk_tensor.shape[1]
+            doc_id = all_chunk_cache[6]
+            chunk_id = all_chunk_cache[7]
+            doc_hash = all_chunk_cache[8]
+            chunk_token_len = all_chunk_cache[9]
             try:
+                chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
+                if chunk_tensor.ndim < 2:
+                    logger.warning(
+                        "[FusionRAG] skip incompatible chunk cache: path=%s reason=invalid_tensor_ndim shape=%s",
+                        tensor_path,
+                        tuple(chunk_tensor.shape),
+                    )
+                    continue
+                prefetch_length = chunk_tensor.shape[1]
                 if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[0]:
-                    # print(f"shape mismatch.")
+                    logger.warning(
+                        "[FusionRAG] skip incompatible chunk cache: path=%s reason=layer_num_mismatch expected=%s actual=%s",
+                        tensor_path,
+                        self.cache_controller.mem_pool_host.layer_num,
+                        chunk_tensor.shape[0],
+                    )
                     continue
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
                 if host_indices is None:
-                    raise "failed to allocate host indices"
+                    raise RuntimeError("failed to allocate host indices")
                 self.cache_controller.mem_pool_host.set_from_indices(
                     host_indices,
                     chunk_tensor
@@ -310,12 +357,20 @@ class FusionragCache(RadixCache):
                 node.host_value = host_indices
                 node.values = []
                 node.text_without_prefix_ids = text_without_prefix_ids
+                node.doc_id = doc_id
+                node.chunk_id = chunk_id
+                node.doc_hash = doc_hash
+                node.chunk_token_len = chunk_token_len
                 self.all_nodes.append(node)
             except Exception as e:
-                print(f"unsupport layout detected. e={e}, preprocess_chunk_caches={preprocess_chunk_caches}")
+                logger.warning(
+                    "[FusionRAG] skip incompatible chunk cache: path=%s reason=layout_or_load_error error=%s",
+                    tensor_path,
+                    e,
+                )
 
         ## sort.
-        self.all_nodes.sort(key=lambda n: len(n.text_without_prefix), reverse=True)
+        self.all_nodes.sort(key=_chunk_node_sort_len, reverse=True)
 
 
     def _parse_storage_backend_extra_config(
@@ -574,6 +629,10 @@ class FusionragCache(RadixCache):
         ""
 
     def match_prefix(self, params: MatchPrefixParams):
+        plan_match_result = self._match_by_plan(params)
+        if plan_match_result is not None:
+            return plan_match_result
+
         all_hit_chunk_nodes = []
         host_hit_length = 0
         if params.key.is_kv_gen:
@@ -641,6 +700,154 @@ class FusionragCache(RadixCache):
             no_need_to_run=False,
         )
 
+    def _match_by_plan(self, params: MatchPrefixParams) -> Optional[MatchResult]:
+        req = params.req
+        plan = getattr(req, "fusionrag_plan", None) if req is not None else None
+        if plan is None or getattr(plan, "schema_version", None) != 2:
+            return None
+
+        if plan.is_kv_gen:
+            save_actions = [
+                action for action in plan.save_actions if action.target == "chunk"
+            ]
+            if not plan.chunk_plan:
+                target_exists = bool(save_actions)
+                for action in save_actions:
+                    node = self._find_chunk_node(
+                        cache_variant=action.variant,
+                        doc_id=action.target_doc_id,
+                        chunk_id=action.target_chunk_id,
+                        doc_hash=action.target_doc_hash,
+                    )
+                    if node is None:
+                        target_exists = False
+                        break
+                if req is not None:
+                    req.fusionrag_chunk_lookup_total = len(save_actions)
+                    req.fusionrag_chunk_lookup_hits = len(save_actions) if target_exists else 0
+                    req.fusionrag_chunk_lookup_misses = 0 if target_exists else len(save_actions)
+                return MatchResult(
+                    device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+                    all_hit_chunk_nodes=[],
+                    host_hit_length=0,
+                    last_host_node=None,
+                    last_device_node=None,
+                    matched_chunk_plan=[],
+                    no_need_to_run=target_exists,
+                )
+
+            all_hit_chunk_nodes = []
+            matched_chunk_plan = []
+            host_hit_length = 0
+            missing_count = 0
+            if req is not None:
+                req.fusionrag_chunk_lookup_total = len(plan.chunk_plan)
+            for chunk in plan.chunk_plan:
+                node = self._find_chunk_node(
+                    cache_variant=chunk.cache_variant,
+                    doc_id=chunk.doc_id,
+                    chunk_id=chunk.chunk_id,
+                    doc_hash=chunk.doc_hash,
+                    expected_token_len=int(chunk.end_token) - int(chunk.start_token),
+                )
+                if node is None:
+                    missing_count += 1
+                    continue
+                host_hit_length += len(node.host_value)
+                all_hit_chunk_nodes.append(node)
+                matched_chunk_plan.append(chunk)
+
+            if req is not None:
+                req.fusionrag_chunk_lookup_hits = len(all_hit_chunk_nodes)
+                req.fusionrag_chunk_lookup_misses = missing_count
+                if missing_count > 0:
+                    req.fusionrag_fallback_reason = "chunk_miss"
+
+            target_exists = missing_count == 0
+            return MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+                all_hit_chunk_nodes=all_hit_chunk_nodes,
+                host_hit_length=host_hit_length,
+                last_host_node=None,
+                last_device_node=None,
+                matched_chunk_plan=matched_chunk_plan,
+                no_need_to_run=target_exists,
+            )
+
+        if not plan.chunk_plan:
+            return None
+
+        all_hit_chunk_nodes = []
+        matched_chunk_plan = []
+        host_hit_length = 0
+        missing_count = 0
+        if req is not None:
+            req.fusionrag_chunk_lookup_total = len(plan.chunk_plan)
+        for chunk in plan.chunk_plan:
+            node = self._find_chunk_node(
+                cache_variant=chunk.cache_variant,
+                doc_id=chunk.doc_id,
+                chunk_id=chunk.chunk_id,
+                doc_hash=chunk.doc_hash,
+                expected_token_len=int(chunk.end_token) - int(chunk.start_token),
+            )
+            if node is None:
+                missing_count += 1
+                continue
+            host_hit_length += len(node.host_value)
+            all_hit_chunk_nodes.append(node)
+            matched_chunk_plan.append(chunk)
+
+        if req is not None:
+            req.fusionrag_chunk_lookup_hits = len(all_hit_chunk_nodes)
+            req.fusionrag_chunk_lookup_misses = missing_count
+            if missing_count > 0:
+                req.fusionrag_fallback_reason = "chunk_miss"
+
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+            all_hit_chunk_nodes=all_hit_chunk_nodes,
+            host_hit_length=host_hit_length,
+            last_host_node=None,
+            last_device_node=None,
+            matched_chunk_plan=matched_chunk_plan,
+            no_need_to_run=False,
+        )
+
+    def _find_chunk_node(
+        self,
+        *,
+        cache_variant: str,
+        doc_id: Optional[str],
+        chunk_id: Optional[str],
+        doc_hash: Optional[str],
+        expected_token_len: Optional[int] = None,
+    ) -> Optional[ChunkNode]:
+        is_preprocess_cache = cache_variant == "preprocess"
+        for node in self.all_nodes:
+            if node.is_preprocess_cache != is_preprocess_cache:
+                continue
+            if chunk_id is not None and node.chunk_id != chunk_id:
+                continue
+            if doc_id is not None and node.doc_id != doc_id:
+                continue
+            if doc_hash is not None and node.doc_hash != doc_hash:
+                continue
+            if expected_token_len is not None and expected_token_len >= 0:
+                node_token_len = node.chunk_token_len
+                if node_token_len is None:
+                    node_token_len = (
+                        len(node.text_without_prefix_ids)
+                        if node.text_without_prefix_ids
+                        else len(node.text_without_prefix)
+                    )
+                if node_token_len != expected_token_len:
+                    continue
+            if chunk_id is None and doc_id is None and doc_hash is None:
+                continue
+            return node
+        return None
+
     def insert(
         self,
         key: RadixKey,
@@ -650,23 +857,38 @@ class FusionragCache(RadixCache):
         is_kv_gen: bool = False,
         kv_gen_prefix_len: int = 0,
         is_preprocess_cache: bool = False,
-        text_without_prefix_ids: List[int] = None
+        text_without_prefix_ids: List[int] = None,
+        doc_id: Optional[str] = None,
+        chunk_id: Optional[str] = None,
+        doc_hash: Optional[str] = None,
     ):
         if is_kv_gen:
             node = ChunkNode()
-            ## 不存储prefix部分
-            node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
-            print(f"text_without_prefix = {node.text_without_prefix}")
-            node.prefix_text = key.prefix_prompt_text
+            origin_input_text = key.origin_input_text or ""
+            prefix_prompt_text = key.prefix_prompt_text or ""
+            if origin_input_text.startswith(prefix_prompt_text):
+                node.text_without_prefix = origin_input_text[len(prefix_prompt_text):]
+            else:
+                node.text_without_prefix = ""
+            node.prefix_text = prefix_prompt_text
             node.values = [value]
             node.priority = priority
             node.cache_prefix_token_len = kv_gen_prefix_len
             node.is_preprocess_cache = is_preprocess_cache
-            target_len = len(node.text_without_prefix)
+            node.text_without_prefix_ids = text_without_prefix_ids or []
+            node.doc_id = doc_id
+            node.chunk_id = chunk_id
+            node.doc_hash = doc_hash
+            node.chunk_token_len = (
+                len(node.text_without_prefix_ids)
+                if node.text_without_prefix_ids
+                else len(node.text_without_prefix)
+            )
+            target_len = _chunk_node_sort_len(node)
             pos = bisect.bisect_left(
                 self.all_nodes,
                 -target_len,
-                key=lambda n: -len(n.text_without_prefix)
+                key=lambda n: -_chunk_node_sort_len(n)
             )
             self.all_nodes.insert(pos, node)
             ## 把数据写回主存里
@@ -723,7 +945,8 @@ class FusionragCache(RadixCache):
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        if req.is_kv_gen and req.save_preprocess_cache:
+        save_variants = self._get_save_variants(req)
+        if req.is_kv_gen and "preprocess" in save_variants:
             print(f"save preprocess cache") ## for debug
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
         logger.error(
@@ -739,33 +962,64 @@ class FusionragCache(RadixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
+            values = kv_indices.to(dtype=torch.int64, copy=True)
+
+            plan = getattr(req, "fusionrag_plan", None)
+            kv_gen = getattr(plan, "kv_gen", None) if plan is not None else None
+            target_doc_id = kv_gen.get("target_doc_id") if isinstance(kv_gen, dict) else None
+            target_chunk_id = kv_gen.get("target_chunk_id") if isinstance(kv_gen, dict) else None
+
+            span_start = 0
+            span_end = len(token_ids)
+            if plan is not None and getattr(plan, "schema_version", None) == 2 and getattr(plan, "chunk_plan", None):
+                for chunk in plan.chunk_plan:
+                    if target_chunk_id is not None and chunk.chunk_id != target_chunk_id:
+                        continue
+                    if target_doc_id is not None and chunk.doc_id != target_doc_id:
+                        continue
+                    span_start = int(chunk.start_token)
+                    span_end = int(chunk.end_token)
+                    break
+
+            span_start = max(0, min(span_start, len(token_ids)))
+            span_end = max(span_start, min(span_end, len(token_ids)))
+
             radix_key = RadixKey(
-                token_ids=token_ids,
+                token_ids=token_ids[span_start:span_end],
                 origin_input_text=req.origin_input_text,
                 prefix_prompt_text=req.prefix_prompt,
             )
-            values = kv_indices.to(dtype=torch.int64, copy=True)
 
-            kv_prefix_len = req.kv_gen_prefix_len ## this is right
-            text_without_prefix_ids = req.origin_input_ids[kv_prefix_len:]
-            assert len(text_without_prefix_ids) == len(values) - kv_prefix_len
-            print(f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
-                  f"values={len(values)}\n"
-                  f"kv_prefix_len={kv_prefix_len}\n")
-            self.insert(
-                radix_key,
-                values[kv_prefix_len:], ## 不存储prefix部分
-                priority=0,
-                is_kv_gen=True,
-                kv_gen_prefix_len=kv_prefix_len,
-                is_preprocess_cache=req.save_preprocess_cache,
-                text_without_prefix_ids=text_without_prefix_ids
+            text_without_prefix_ids = token_ids[span_start:span_end]
+            print(
+                f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
+                f"values={len(values)}\n"
+                f"kv_span=[{span_start}, {span_end})\n"
             )
-            prompt_ids = req.origin_input_ids
-            prefix_prompt_ids = req.kv_gen_prefix_len
-            prompt_ids_without_prefix = prompt_ids[prefix_prompt_ids:]
-            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
-                                      prompt_ids_without_prefix) ## 不存储prefix部分
+
+            for variant in save_variants:
+                action_metadata = self._get_save_action_metadata(req, variant)
+                self.insert(
+                    radix_key,
+                    values[span_start:span_end],
+                    priority=0,
+                    is_kv_gen=True,
+                    kv_gen_prefix_len=0,
+                    is_preprocess_cache=(variant == "preprocess"),
+                    text_without_prefix_ids=text_without_prefix_ids,
+                    doc_id=action_metadata.get("doc_id"),
+                    chunk_id=action_metadata.get("chunk_id"),
+                    doc_hash=action_metadata.get("doc_hash"),
+                )
+
+            for variant in save_variants:
+                self._write_cache_to_disk(
+                    req,
+                    kv_indices[span_start:span_end],
+                    0,
+                    text_without_prefix_ids,
+                    variant,
+                )
 
             ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
             kv_committed_len = req.pop_committed_kv_cache()
@@ -787,46 +1041,121 @@ class FusionragCache(RadixCache):
 
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
-    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
+    def _get_save_variants(self, req: Req) -> List[str]:
+        plan = getattr(req, "fusionrag_plan", None)
+        if plan is not None and getattr(plan, "save_actions", None):
+            variants = [
+                action.variant
+                for action in plan.save_actions
+                if action.target == "chunk" and action.variant in ("raw", "preprocess")
+            ]
+            if variants:
+                return variants
+
+        variants = []
+        if req.save_raw_cache:
+            variants.append("raw")
+        if req.save_preprocess_cache:
+            variants.append("preprocess")
+        return variants
+
+    def _get_save_action_metadata(self, req: Req, variant: str) -> dict[str, Any]:
+        plan = getattr(req, "fusionrag_plan", None)
+        if plan is None or getattr(plan, "save_actions", None) is None:
+            return {}
+
+        for action in plan.save_actions:
+            if action.target == "chunk" and action.variant == variant:
+                return {
+                    "doc_id": action.target_doc_id,
+                    "chunk_id": action.target_chunk_id,
+                    "doc_hash": action.target_doc_hash,
+                }
+        return {}
+
+    def _write_cache_to_disk(
+        self,
+        req: Req,
+        kv_indices_: torch.Tensor,
+        kv_prefix_len: int,
+        text_without_prefix_ids: List[int],
+        variant: str,
+    ) -> None:
         kv_cache = []
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
             kv_cache.append(k_buffer)
         kv_cache = torch.stack(kv_cache, dim=0)
         print(f"[_write_cache_to_disk] kv_cache={kv_cache.shape}, kv_indices_={kv_indices_.shape}, kv_prefix_len={kv_prefix_len}")
-        text = req.origin_input_text
-        prefix_prompt = req.prefix_prompt
+        text = req.origin_input_text or ""
+        prefix_prompt = req.prefix_prompt or ""
         cache_prefix_token_len = kv_prefix_len
+        action_metadata = self._get_save_action_metadata(req, variant)
+        if text.startswith(prefix_prompt):
+            text_without_prefix = text[len(prefix_prompt):]
+        else:
+            text_without_prefix = ""
         metadata = {
-            "text": text[len(prefix_prompt):],  ## only save the document itself.
+            "fusionrag_cache_format_version": 2,
+            "text": text_without_prefix,  ## only save the document itself when available.
             "cache_prefix_token_len": cache_prefix_token_len,
             "prefix_text": prefix_prompt,
             "text_without_prefix_ids": text_without_prefix_ids,
+            "doc_id": action_metadata.get("doc_id"),
+            "chunk_id": action_metadata.get("chunk_id"),
+            "doc_hash": action_metadata.get("doc_hash"),
+            "chunk_token_len": len(text_without_prefix_ids),
+            "cache_variant": variant,
+            "kv_shape": list(kv_cache.shape),
+            "layer_num": self.kv_cache.layer_num,
         }
         ## 同步执行环境，不存在锁的问题
-        md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
-        if req.save_preprocess_cache is True:
+        cache_key_material = text_without_prefix or json.dumps(
+            {
+                "variant": variant,
+                "doc_id": action_metadata.get("doc_id"),
+                "chunk_id": action_metadata.get("chunk_id"),
+                "doc_hash": action_metadata.get("doc_hash"),
+                "text_without_prefix_ids": text_without_prefix_ids,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        md5_hash = hashlib.md5(cache_key_material.encode("utf-8")).hexdigest()
+        if variant == "preprocess":
             passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
             logger.error(
                 "save to PREPROCESS cache\n"
-                f"text=\n{text[len(prefix_prompt):]}\n"
+                f"text=\n{text_without_prefix}\n"
                 f"prefix=\n{prefix_prompt}"
             )
-        elif req.save_raw_cache is True:
+        elif variant == "raw":
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
             logger.error(
                 "save to RAW cache\n"
-                f"text=\n{text[len(prefix_prompt):][:20]}\n"
+                f"text=\n{text_without_prefix[:20]}\n"
                 f"prefix=\n{prefix_prompt}"
             )
         else:
-            raise ValueError("either save_preprocess_cache or save_raw_cache must be True")
+            raise ValueError(f"unsupported cache save variant: {variant}")
         logger.error(f"cache save path: {passage_kv_path}")
         os.makedirs(passage_kv_path, exist_ok=True)
+        ready_path = f"{passage_kv_path}/{_CACHE_READY_SENTINEL}"
         metadata_file_path = f"{passage_kv_path}/metadata.json"
-        with open(metadata_file_path, 'w') as f:
+        tmp_metadata_path = f"{metadata_file_path}.tmp"
+        tensor_file_path = f"{passage_kv_path}/{md5_hash}.pt"
+        tmp_tensor_file_path = f"{tensor_file_path}.tmp"
+
+        # clear stale readiness marker before writing new cache artifacts.
+        if os.path.exists(ready_path):
+            os.remove(ready_path)
+        with open(tmp_metadata_path, 'w') as f:
             json.dump(metadata, f)
-        torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
+        torch.save(kv_cache, tmp_tensor_file_path)
+        os.replace(tmp_metadata_path, metadata_file_path)
+        os.replace(tmp_tensor_file_path, tensor_file_path)
+        with open(ready_path, "w", encoding="utf-8") as f:
+            f.write("1")
 
     def dec_lock_ref(self, node: ChunkNode):
         ""

@@ -934,7 +934,7 @@ class MHATokenToKVPool(KVCache):
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -945,7 +945,7 @@ class MHATokenToKVPool(KVCache):
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            wait_for_all(self.layer_transfer_counter, layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):

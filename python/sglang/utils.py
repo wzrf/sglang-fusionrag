@@ -24,13 +24,20 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 import numpy as np
 import pybase64
 import requests
-from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+try:
+    from IPython.display import HTML, display  # type: ignore
+except ModuleNotFoundError:  # Optional dependency
+    HTML = None
+
+    def display(*_args, **_kwargs):  # type: ignore
+        return None
 
 
 def execute_once(func):

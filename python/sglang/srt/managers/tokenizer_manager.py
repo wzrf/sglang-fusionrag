@@ -42,6 +42,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.fusionrag_params import (
+    is_fusionrag_v2_schema,
+    normalize_fusionrag_params,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
@@ -731,6 +735,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 input_text, is_cross_encoder_request
             )
             if obj.fusionrag_params is not None:
+                if is_fusionrag_v2_schema(obj.fusionrag_params):
+                    obj.fusionrag_params = normalize_fusionrag_params(
+                        obj.fusionrag_params,
+                        input_ids_len=len(input_ids),
+                    )
+
                 if "prompt_list" in obj.fusionrag_params:
                     prompt_list = obj.fusionrag_params["prompt_list"]
                     prompt_ids_list = []
@@ -742,8 +752,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prompt_ids_list"] = prompt_ids_list
                     ## 重新赋值input_ids
                     input_ids = [num for sublist in prompt_ids_list for num in sublist]
-                else:
-                    print(f"mengyao_debug prompt_list should be in params.")
 
                 if "prefix_prompt_list" in obj.fusionrag_params:
                     prefix_prompt_list = obj.fusionrag_params["prefix_prompt_list"]
@@ -756,19 +764,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prefix_prompt_ids_list"] = prefix_prompt_ids_list
                     prefix_prompt_ids = [num for sublist in prefix_prompt_ids_list for num in sublist]
                     obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
-                else:
-                    print(f"mengyao_debug prefix_prompt_list should be in params.")
 
-                prefix_prompt_ = obj.fusionrag_params["prefix_prompt"]
-                prompt_ = input_text
-                if not prompt_.startswith(prefix_prompt_) and prefix_prompt_ in prompt_:
-                    prefix_cache_prompt = prompt_[:prompt_.index(prefix_prompt_)]
-                    prefix_cache_ids, _ = await self._tokenize_texts(
-                        prefix_cache_prompt, is_cross_encoder_request
-                    )
-                    obj.fusionrag_params["prefix_cache_ids"] = prefix_cache_ids
-                else:
-                    obj.fusionrag_params["prefix_cache_ids"] = []
+                if "prefix_prompt" in obj.fusionrag_params:
+                    prefix_prompt_ = obj.fusionrag_params["prefix_prompt"]
+                    prompt_ = input_text
+                    if not prompt_.startswith(prefix_prompt_) and prefix_prompt_ in prompt_:
+                        prefix_cache_prompt = prompt_[:prompt_.index(prefix_prompt_)]
+                        prefix_cache_ids, _ = await self._tokenize_texts(
+                            prefix_cache_prompt, is_cross_encoder_request
+                        )
+                        obj.fusionrag_params["prefix_cache_ids"] = prefix_cache_ids
+                    else:
+                        obj.fusionrag_params["prefix_cache_ids"] = []
 
                 if "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(

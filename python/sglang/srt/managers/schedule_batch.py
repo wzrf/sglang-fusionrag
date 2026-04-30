@@ -56,6 +56,13 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.fusionrag_plan import (
+    apply_legacy_fusionrag_fields,
+    build_fusionrag_plan,
+    compute_request_local_recompute_indices,
+    disable_recompute_for_return_logprob,
+    select_prefix_compatible_chunk_hits,
+)
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
@@ -490,6 +497,7 @@ class Req(ReqDllmMixin):
         origin_input_ids: List[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
+        logprob_start_len: int = -1,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
@@ -544,44 +552,25 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        self.use_chunk_node: bool = False ##mengyao_debug hardcode
+        self.use_chunk_node: bool = False
         self.use_mix_prefix_cache: bool = True
         self.prefix_cache_ids: List[int] = []
         self.hit_chunk_nodes: Any = None
+        self.hit_chunk_plan: List[Any] = []
         self.hit_chunk_values: Any = None
         self.recompute_idx: List[int] = []
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
-
-        if fusionrag_params is not None:
-            ## 1. is_kv_gen=True, save_preprocess_cache=False, 直接查看raw cache里是否存在
-            ## 2. is_kv_gen=True, save_preprocess_cache=True, 和raw_cache decode请求一样，去raw cache 匹配
-            ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
-            ## 3. is_kv_gen=False, load_preprocess_cache=True, 去preprocess cache 匹配
-            self.is_kv_gen = fusionrag_params.get("save_cache", False)
-            self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
-            self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
-            self.recompute_idx = fusionrag_params.get("recompute_idx", [])
-            self.save_raw_cache = not self.save_preprocess_cache
-            self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
-            self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
-            self.prefix_prompt_ids_list = fusionrag_params.get("prefix_prompt_ids_list", [])
-            self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
-            self.prefix_cache_ids = fusionrag_params.get("prefix_cache_ids", [])
-            #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
-            if self.is_kv_gen and self.save_preprocess_cache:
-                self.use_preprocess_cache = False
-            fusionrag_params = None
-        else:
-            self.is_kv_gen = False
-            self.kv_gen_prefix_len = 0
-            self.prefix_prompt = ""
-            self.save_preprocess_cache = False
-            self.save_raw_cache = False
-            self.use_preprocess_cache = False
-            self.recompute_idx = []
-            self.prompt_ids_list = []
-            self.prefix_prompt_ids_list = []
+        self.extend_compute_len: int = 0
+        self.fusionrag_chunk_lookup_total = 0
+        self.fusionrag_chunk_lookup_hits = 0
+        self.fusionrag_chunk_lookup_misses = 0
+        self.fusionrag_fallback_reason: Optional[str] = None
+        self.fusionrag_plan = build_fusionrag_plan(
+            fusionrag_params,
+            input_ids_len=len(origin_input_ids),
+        )
+        apply_legacy_fusionrag_fields(self, fusionrag_params, self.fusionrag_plan)
         # shm debug
         # self.is_kv_gen = True
 
@@ -710,7 +699,7 @@ class Req(ReqDllmMixin):
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
-        self.logprob_start_len = 0
+        self.logprob_start_len = logprob_start_len
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
@@ -908,6 +897,15 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def requests_input_logprobs(self) -> bool:
+        if not self.return_logprob or self.logprob_start_len < 0:
+            return False
+        # `logprob_start_len == -1` is the API contract meaning "output-only".
+        # Internally we may rewrite it to `len(origin_input_ids) - 1` (or `len(origin_input_ids)`
+        # for prefill-only) to make the logprob pipeline work, but this should NOT be treated as
+        # "requesting input logprobs".
+        return self.logprob_start_len < max(len(self.origin_input_ids) - 1, 0)
+
     def init_next_round_input(self, tree_cache_hicache: Optional[BasePrefixCache] = None,
                               tree_cache_fusionrag: Optional[BasePrefixCache] = None):
         if self.is_dllm():
@@ -929,7 +927,6 @@ class Req(ReqDllmMixin):
         if self.is_kv_gen:
             match_result = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
-                    # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
                     key=RadixKey(token_ids=token_ids,
                                  extra_key=self.extra_key,
                                  origin_input_text=self.origin_input_text,
@@ -939,11 +936,14 @@ class Req(ReqDllmMixin):
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
                                  prefix_prompt_ids_list=self.prefix_prompt_ids_list
                                  ),
-                    req=self if tree_cache_fusionrag.supports_mamba() else None,
+                    req=self,
                     cow_mamba=tree_cache_fusionrag.supports_mamba(),
                 ),
             )
             self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
+            self.hit_chunk_plan = getattr(match_result, "matched_chunk_plan", []) or []
+            self.host_hit_length_hicache = 0
+            self.host_hit_length_fusionrag = match_result.host_hit_length
             self.host_hit_length = match_result.host_hit_length
             self.prefix_indices = match_result.device_indices  ## empty
             if match_result.no_need_to_run:
@@ -983,27 +983,63 @@ class Req(ReqDllmMixin):
             )
             self.cache_protected_len = len(self.prefix_indices_hicache)
 
-            match_result_fusionrag = tree_cache_fusionrag.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=token_ids,
-                                 extra_key=self.extra_key,
-                                 origin_input_text=self.origin_input_text, ## todo mengyao_debug 这里不用改，用不到
-                                 prefix_prompt_text=self.prefix_prompt, ## todo mengyao_debug 这里需要改，改成从chunk位置开始匹配
-                                 is_kv_gen=self.is_kv_gen,
-                                 is_preprocess_kv_gen=self.save_preprocess_cache,
-                                 use_preprocess_kv_cache=self.use_preprocess_cache,
-                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
-                                 ),
-                    req=self if tree_cache_hicache.supports_mamba() else None,
-                    cow_mamba=tree_cache_hicache.supports_mamba(),
-                ),
-            )
+            if self.requests_input_logprobs():
+                if self.fusionrag_plan is not None and getattr(self.fusionrag_plan, "schema_version", None) == 2:
+                    self.fusionrag_fallback_reason = "input_logprob_cache_hit_unsupported"
+                from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+
+                match_result_fusionrag = MatchResult(
+                    device_indices=torch.empty(
+                        (0,), dtype=torch.int64, device=tree_cache_fusionrag.device
+                    ),
+                    all_hit_chunk_nodes=[],
+                    host_hit_length=0,
+                    last_host_node=None,
+                    last_device_node=None,
+                    matched_chunk_plan=[],
+                    no_need_to_run=False,
+                )
+            else:
+                match_result_fusionrag = tree_cache_fusionrag.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=token_ids,
+                                     extra_key=self.extra_key,
+                                     origin_input_text=self.origin_input_text,
+                                     prefix_prompt_text=self.prefix_prompt,
+                                     is_kv_gen=self.is_kv_gen,
+                                     is_preprocess_kv_gen=self.save_preprocess_cache,
+                                     use_preprocess_kv_cache=self.use_preprocess_cache,
+                                     prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                     ),
+                        req=self,
+                        cow_mamba=tree_cache_fusionrag.supports_mamba(),
+                    ),
+                )
 
             self.hit_chunk_nodes = match_result_fusionrag.all_hit_chunk_nodes
+            self.hit_chunk_plan = getattr(match_result_fusionrag, "matched_chunk_plan", []) or []
+            (
+                self.hit_chunk_plan,
+                compatible_chunk_lens,
+                used_all_chunk_hits,
+            ) = select_prefix_compatible_chunk_hits(
+                prefix_hicache_len=len(self.prefix_indices_hicache),
+                hit_chunk_plans=self.hit_chunk_plan,
+                hit_chunk_token_lens=[
+                    len(chunk_node.host_value) for chunk_node in self.hit_chunk_nodes
+                ],
+            )
+            self.hit_chunk_nodes = self.hit_chunk_nodes[: len(self.hit_chunk_plan)]
+            if not used_all_chunk_hits:
+                self.fusionrag_fallback_reason = "non_contiguous_chunk_span"
             self.host_hit_length_fusionrag = match_result_fusionrag.host_hit_length
+            if compatible_chunk_lens:
+                self.host_hit_length_fusionrag = sum(compatible_chunk_lens)
+            else:
+                self.host_hit_length_fusionrag = 0
             self.prefix_indices_fusionrag = match_result_fusionrag.device_indices  ## empty, will be assigned at add_one_req later.
 
-            self.prefix_indices = self.prefix_indices_hicache ## mengyao_debug: in fusionrag cache this is empty.
+            self.prefix_indices = self.prefix_indices_hicache
             self.host_hit_length = self.host_hit_length_fusionrag + self.host_hit_length_hicache
 
 
@@ -1263,6 +1299,30 @@ class Req(ReqDllmMixin):
             self.extend_input_len,
         )
 
+    def remap_recompute_indices_from_plan(self, prefix_hicache_len: int):
+        self.recompute_idx = compute_request_local_recompute_indices(
+            self.fusionrag_plan,
+            prefix_hicache_len=prefix_hicache_len,
+            hit_chunk_plans=self.hit_chunk_plan,
+            hit_chunk_token_lens=[
+                len(chunk_node.host_value) for chunk_node in (self.hit_chunk_nodes or [])
+            ],
+            prefix_indices_len=len(self.prefix_indices),
+            fallback_recompute_idx=self.recompute_idx,
+        )
+        self.apply_fusionrag_runtime_guards()
+
+    def apply_fusionrag_runtime_guards(self):
+        recompute_idx, fallback_reason = disable_recompute_for_return_logprob(
+            self.recompute_idx,
+            return_logprob=self.requests_input_logprobs(),
+            extend_input_len=self.extend_input_len,
+            extend_logprob_start_len=self.extend_logprob_start_len,
+        )
+        self.recompute_idx = recompute_idx
+        if fallback_reason and self.fusionrag_fallback_reason is None:
+            self.fusionrag_fallback_reason = fallback_reason
+
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
@@ -1274,6 +1334,32 @@ class Req(ReqDllmMixin):
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def get_fusionrag_customized_info(self) -> Optional[Dict[str, List[Any]]]:
+        if self.fusionrag_plan is None or getattr(self.fusionrag_plan, "schema_version", None) != 2:
+            return None
+
+        chunk_hit_tokens = self.host_hit_length_fusionrag
+        radix_hit_tokens = self.host_hit_length_hicache
+        recompute_tokens = len(self.recompute_idx)
+        compute_tokens = len(self.all_compute_idx)
+        prefill_tokens = max(
+            0, len(self.fill_ids) - int(radix_hit_tokens) - int(chunk_hit_tokens)
+        )
+        fallback_reason = self.fusionrag_fallback_reason or ""
+
+        return {
+            "fusionrag_mode": [self.fusionrag_plan.mode],
+            "fusionrag_radix_hit_tokens": [radix_hit_tokens],
+            "fusionrag_chunk_hit_tokens": [chunk_hit_tokens],
+            "fusionrag_recompute_tokens": [recompute_tokens],
+            "fusionrag_compute_tokens": [compute_tokens],
+            "fusionrag_prefill_tokens": [prefill_tokens],
+            "fusionrag_chunk_lookup_total": [self.fusionrag_chunk_lookup_total],
+            "fusionrag_chunk_lookup_hits": [self.fusionrag_chunk_lookup_hits],
+            "fusionrag_chunk_lookup_misses": [self.fusionrag_chunk_lookup_misses],
+            "fusionrag_fallback_reason": [fallback_reason],
+        }
 
     def __repr__(self):
         return (
@@ -1496,17 +1582,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 input_ids[i] = input_ids[i][encoder_len:]
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_compute_len]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                    self.out_cache_loc[pt : pt + req.extend_compute_len]
                 )
                 self.prefix_lens[i] -= encoder_len
 
-            pt += req.extend_input_len
+            pt += req.extend_compute_len
 
         # Reassign
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
@@ -1548,32 +1634,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = []
         input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         recompute_cache_indices = []
+        compute_positions = []
         for r in reqs:
-            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
+            r.apply_fusionrag_runtime_guards()
+            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
             r.all_compute_idx.extend(extend_compute_idx)
-            ## mengyao_debug: just in case it overlaps
             r.all_compute_idx = sorted(set(r.all_compute_idx))
-            if r.is_kv_gen:
-                print(f"mengyao_debug This is a KV GEN TASK")
-            else:
-                print(f"mengyao_debug This is a DECODER TASK")
-            if len(r.prefix_indices) >0:
-                print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
-            else:
-                print(f"mengyao_debug compute percentage=100%")
-            # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")
-            # print(f"r.fill_ids = {len(r.fill_ids)}")
+            r.extend_compute_len = len(r.all_compute_idx)
+            compute_positions.append(r.all_compute_idx)
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
 
-        extend_num_tokens = sum(len(ids) for ids in input_ids_only_extend)
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        extend_lens = [r.extend_compute_len for r in reqs]
+        alloc_extend_lens = [r.extend_input_len for r in reqs]
 
 
         # For matryoshka embeddings
@@ -1609,6 +1688,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
+        self.alloc_extend_lens = alloc_extend_lens
+        self.compute_positions = compute_positions
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
@@ -2280,9 +2361,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            extend_seq_lens = extend_input_lens = extend_prefix_lens = (
+                extend_logprob_start_lens
+            ) = None
         else:
             extend_seq_lens = self.extend_lens
+            extend_input_lens = self.alloc_extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
@@ -2316,6 +2400,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_forward_mode=self.global_forward_mode,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
+            extend_input_lens=extend_input_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             multimodal_inputs=self.multimodal_inputs,
@@ -2479,6 +2564,7 @@ class ModelWorkerBatch:
     # For extend
     extend_num_tokens: Optional[int]
     extend_seq_lens: Optional[List[int]]
+    extend_input_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]

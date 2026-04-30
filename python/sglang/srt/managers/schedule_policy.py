@@ -776,6 +776,7 @@ class PrefillAdder:
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
                         req.cache_protected_len = prefix_len
+                        req.remap_recompute_indices_from_plan(prefix_hicache_len=0)
                     else:
                         new_indices_hicache, req.last_node = self.tree_cache_hicache.init_load_back(
                             req.last_host_node, req.host_hit_length_hicache
@@ -792,6 +793,9 @@ class PrefillAdder:
                         prefix_len = len(req.prefix_indices)
                         ## 把fusionrag cache视作decode出来的内容，不然这显存部分释放不掉
                         req.cache_protected_len = len(prefix_indices_hicache)
+                        req.remap_recompute_indices_from_plan(
+                            prefix_hicache_len=len(prefix_indices_hicache)
+                        )
 
                 else:
                     if not req.use_chunk_node:
@@ -813,6 +817,7 @@ class PrefillAdder:
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
                         req.cache_protected_len = prefix_len
+                        req.remap_recompute_indices_from_plan(prefix_hicache_len=0)
 
             ### make sure it doesn't overflow
             req.recompute_idx = [idx for idx in req.recompute_idx if idx < len(req.prefix_indices)]

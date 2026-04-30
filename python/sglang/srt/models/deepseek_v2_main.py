@@ -2963,4 +2963,6 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+# This module is kept for reference during the branch merge, but the canonical
+# runtime registration lives in `deepseek_v2.py`. Registering both modules
+# makes model startup fail with duplicated architectures.

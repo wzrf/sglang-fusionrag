@@ -1112,6 +1112,13 @@ class SchedulerOutputProcessorMixin:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
 
+                fusionrag_customized_info = req.get_fusionrag_customized_info()
+                if fusionrag_customized_info is not None:
+                    if req.customized_info is None:
+                        req.customized_info = {}
+                    for k, v in fusionrag_customized_info.items():
+                        req.customized_info[k] = v
+
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:

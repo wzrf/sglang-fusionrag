@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.fusionrag_plan import compute_extend_logprob_pruned_lens
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -119,6 +120,7 @@ class LogitsMetadata:
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_all_compute_lens: Optional[torch.Tensor] = None
+    extend_input_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
@@ -164,15 +166,12 @@ class LogitsMetadata:
             extend_token_ids_logprob = any(
                 x is not None for x in forward_batch.token_ids_logprobs
             )
-            extend_return_logprob = False
-            extend_logprob_pruned_lens_cpu = []
-            for extend_len, start_len in zip(
-                forward_batch.extend_seq_lens_cpu,
-                forward_batch.extend_logprob_start_lens_cpu,
-            ):
-                if extend_len - start_len > 0:
-                    extend_return_logprob = True
-                extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
+            extend_return_logprob, extend_logprob_pruned_lens_cpu = (
+                compute_extend_logprob_pruned_lens(
+                    list(forward_batch.extend_input_lens_cpu),
+                    list(forward_batch.extend_logprob_start_lens_cpu),
+                )
+            )
         else:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob
@@ -188,6 +187,7 @@ class LogitsMetadata:
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_all_compute_lens=forward_batch.extend_all_compute_len,
+            extend_input_lens_cpu=forward_batch.extend_input_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,

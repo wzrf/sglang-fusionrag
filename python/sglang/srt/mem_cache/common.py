@@ -75,6 +75,31 @@ def write_req_to_token_pool_triton(
         )
 
 
+@triton.jit
+def write_req_to_token_pool_sparse_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    flat_req_pool_indices,  # [num_sparse]
+    flat_positions,  # [num_sparse]
+    sparse_values,  # [num_sparse]
+    num_sparse,
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < num_sparse
+
+    req_pool_index = tl.load(flat_req_pool_indices + offset, mask=mask, other=0)
+    position = tl.load(flat_positions + offset, mask=mask, other=0)
+    value = tl.load(sparse_values + offset, mask=mask, other=0)
+
+    tl.store(
+        req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + position,
+        value,
+        mask=mask,
+    )
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -87,9 +112,11 @@ def write_cache_indices(
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
+    compute_positions: list[list[int]] | None = None,
 ):
-    ## mengyao_debug hardcode just for easy debug
-    if False and support_triton(get_global_server_args().attention_backend):
+    # Triton fast path does contiguous [prefix, extend] writes.
+    # When compute_positions is provided, we need sparse writes and fall back to Python path.
+    if compute_positions is None and support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -108,21 +135,66 @@ def write_cache_indices(
         )
     else:
         pt = 0
+        sparse_req_indices = []
+        sparse_positions = []
+        sparse_values = []
+        use_sparse_triton = (
+            compute_positions is not None
+            and support_triton(get_global_server_args().attention_backend)
+        )
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
             prefix_len = prefix_lens_cpu[i].item()
             seq_len = seq_lens_cpu[i].item()
             extend_len = extend_lens_cpu[i].item()
+            pool_dtype = req_to_token_pool.req_to_token.dtype
 
             req_to_token_pool.write(
                 (req_idx, slice(0, prefix_len)),
-                prefix_tensors[i],
+                prefix_tensors[i].to(dtype=pool_dtype),
             )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
+            if compute_positions is None:
+                req_to_token_pool.write(
+                    (req_idx, slice(prefix_len, seq_len)),
+                    out_cache_loc[pt : pt + extend_len].to(dtype=pool_dtype),
+                )
+            else:
+                if use_sparse_triton:
+                    positions_i = compute_positions[i]
+                    sparse_req_indices.extend([req_idx] * len(positions_i))
+                    sparse_positions.extend(positions_i)
+                    sparse_values.append(out_cache_loc[pt : pt + extend_len].to(dtype=pool_dtype))
+                else:
+                    req_to_token_pool.write(
+                        (
+                            req_idx,
+                            torch.tensor(
+                                compute_positions[i],
+                                dtype=torch.int64,
+                                device=req_to_token_pool.device,
+                            ),
+                        ),
+                        out_cache_loc[pt : pt + extend_len].to(dtype=pool_dtype),
+                    )
             pt += extend_len
+
+        if use_sparse_triton and sparse_positions:
+            sparse_req_indices_tensor = torch.tensor(
+                sparse_req_indices, dtype=torch.int64, device=req_to_token_pool.device
+            )
+            sparse_positions_tensor = torch.tensor(
+                sparse_positions, dtype=torch.int64, device=req_to_token_pool.device
+            )
+            sparse_values_tensor = torch.cat(sparse_values, dim=0)
+            num_sparse = sparse_positions_tensor.shape[0]
+            write_req_to_token_pool_sparse_triton[(triton.cdiv(num_sparse, 512),)](
+                req_to_token_pool.req_to_token,
+                sparse_req_indices_tensor,
+                sparse_positions_tensor,
+                sparse_values_tensor,
+                num_sparse,
+                req_to_token_pool.req_to_token.shape[1],
+            )
 
 
 def get_last_loc(
@@ -343,10 +415,11 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    compute_positions = batch.compute_positions
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    extend_lens_cpu = torch.tensor(batch.alloc_extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -360,26 +433,31 @@ def alloc_for_extend(
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache_hicache.page_size == 1:
         # out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-        out_cache_loc = torch.tensor([]).to(batch.device)
-        out_cache_loc_extends = torch.tensor([]).to(batch.device)
+        out_cache_loc = torch.tensor([], dtype=torch.int64, device=batch.device)
         for i, req in enumerate(batch.reqs):
             recompute_cache_index = recompute_cache_indices[i]
             out_cache_loc_extend = alloc_token_slots(batch.tree_cache_hicache, len(input_ids_only_extend[i]))
-            out_cache_loc = torch.cat([out_cache_loc, recompute_cache_index, out_cache_loc_extend]).to(torch.int64)
-            out_cache_loc_extends = torch.cat([out_cache_loc_extends, out_cache_loc_extend]).to(torch.int64)
+            out_cache_loc = torch.cat(
+                [
+                    out_cache_loc,
+                    recompute_cache_index.to(torch.int64),
+                    out_cache_loc_extend.to(torch.int64),
+                ]
+            )
 
         write_cache_indices(
-            out_cache_loc_extends,
+            out_cache_loc,
             req_pool_indices_device,
             req_pool_indices_cpu,
             prefix_lens_device,
             prefix_lens_cpu,
             batch.seq_lens,
             batch.seq_lens_cpu,
-            extend_lens_device,
-            extend_lens_cpu,
+            torch.tensor(batch.extend_lens, dtype=torch.int64, device=batch.device),
+            torch.tensor(batch.extend_lens, dtype=torch.int64),
             prefix_tensors,
             batch.req_to_token_pool,
+            compute_positions=compute_positions,
         )
 
     else:
@@ -388,15 +466,28 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
-        out_cache_loc = alloc_paged_token_slots_extend(
+        out_cache_loc_extend = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=batch.seq_lens,
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
+            extend_num_tokens=sum(batch.alloc_extend_lens),
         )
+        out_cache_loc = torch.tensor([], dtype=torch.int64, device=batch.device)
+        pt = 0
+        for i, req in enumerate(batch.reqs):
+            alloc_len = batch.alloc_extend_lens[i]
+            recompute_cache_index = recompute_cache_indices[i].to(torch.int64)
+            out_cache_loc = torch.cat(
+                [
+                    out_cache_loc,
+                    recompute_cache_index,
+                    out_cache_loc_extend[pt : pt + alloc_len].to(torch.int64),
+                ]
+            )
+            pt += alloc_len
 
         # Write to req_to_token_pool
         write_cache_indices(
@@ -407,10 +498,11 @@ def alloc_for_extend(
             prefix_lens_cpu,
             batch.seq_lens,
             batch.seq_lens_cpu,
-            extend_lens_device,
-            extend_lens_cpu,
+            torch.tensor(batch.extend_lens, dtype=torch.int64, device=batch.device),
+            torch.tensor(batch.extend_lens, dtype=torch.int64),
             prefix_tensors,
             batch.req_to_token_pool,
+            compute_positions=compute_positions,
         )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
