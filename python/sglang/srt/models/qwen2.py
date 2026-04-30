@@ -59,6 +59,37 @@ Qwen2Config = None
 logger = logging.getLogger(__name__)
 
 
+def _correct_rope_rotation_to_positions(
+    k_wrong: torch.Tensor,
+    rotary_cache: torch.Tensor,
+    wrong_positions: torch.Tensor,
+    correct_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate key vectors from wrong RoPE positions to correct positions."""
+    seq_len, num_heads_k, head_dim = k_wrong.shape
+    half_dim = head_dim // 2
+
+    wrong_cache = rotary_cache[wrong_positions]
+    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1)
+    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1)
+
+    correct_cache = rotary_cache[correct_positions]
+    cos_correct = correct_cache[:, :half_dim].unsqueeze(1)
+    sin_correct = correct_cache[:, half_dim:].unsqueeze(1)
+
+    cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong
+    sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong
+
+    k_reshaped = k_wrong.view(seq_len, num_heads_k, half_dim, 2)
+    k_even = k_reshaped[..., 0]
+    k_odd = k_reshaped[..., 1]
+
+    k_correct_even = k_even * cos_delta - k_odd * sin_delta
+    k_correct_odd = k_even * sin_delta + k_odd * cos_delta
+    k_correct = torch.stack([k_correct_even, k_correct_odd], dim=-1)
+    return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
+
+
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -366,6 +397,8 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        self._normalize_kv_gen_cache_rope_to_zero(forward_batch)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -384,6 +417,82 @@ class Qwen2Model(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _normalize_kv_gen_cache_rope_to_zero(self, forward_batch: ForwardBatch) -> None:
+        if (
+            forward_batch.forward_mode.name != "EXTEND"
+            or forward_batch.out_cache_loc is None
+            or forward_batch.positions is None
+            or forward_batch.extend_all_compute_len is None
+        ):
+            return
+        reqs = getattr(forward_batch, "reqs", None)
+        if not reqs:
+            return
+
+        cursor = 0
+        compute_lens = forward_batch.extend_all_compute_len.tolist()
+        for req, compute_len in zip(reqs, compute_lens):
+            next_cursor = cursor + int(compute_len)
+            if not getattr(req, "is_kv_gen", False) or compute_len <= 0:
+                cursor = next_cursor
+                continue
+
+            span_start = 0
+            span_end = len(getattr(req, "origin_input_ids", []) or [])
+            plan = getattr(req, "fusionrag_plan", None)
+            if (
+                plan is not None
+                and getattr(plan, "schema_version", None) == 2
+                and getattr(plan, "chunk_plan", None)
+                and isinstance(getattr(plan, "kv_gen", None), dict)
+            ):
+                kv_gen = plan.kv_gen
+                target_doc_id = kv_gen.get("target_doc_id")
+                target_chunk_id = kv_gen.get("target_chunk_id")
+                for chunk in plan.chunk_plan:
+                    if target_chunk_id is not None and chunk.chunk_id != target_chunk_id:
+                        continue
+                    if target_doc_id is not None and chunk.doc_id != target_doc_id:
+                        continue
+                    span_start = int(chunk.start_token)
+                    span_end = int(chunk.end_token)
+                    break
+
+            positions_slice = forward_batch.positions[cursor:next_cursor].to(torch.int64)
+            cache_indices_slice = forward_batch.out_cache_loc[cursor:next_cursor].to(torch.int64)
+            in_span_mask = (positions_slice >= span_start) & (positions_slice < span_end)
+            if not torch.any(in_span_mask):
+                cursor = next_cursor
+                continue
+
+            selected_positions = positions_slice[in_span_mask]
+            selected_indices = cache_indices_slice[in_span_mask]
+            wrong_positions = selected_positions
+            correct_positions = selected_positions - int(span_start)
+
+            for layer_id in range(self.start_layer, self.end_layer):
+                layer = self.layers[layer_id]
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[
+                    selected_indices, :, :
+                ]
+                k_correct = _correct_rope_rotation_to_positions(
+                    k_buffer,
+                    layer.self_attn.rotary_emb.cos_sin_cache,
+                    wrong_positions=wrong_positions,
+                    correct_positions=correct_positions,
+                )
+                v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer_id)[
+                    selected_indices, :, :
+                ]
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer.self_attn.attn,
+                    selected_indices,
+                    k_correct,
+                    v_buffer,
+                    layer_id,
+                )
+            cursor = next_cursor
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
