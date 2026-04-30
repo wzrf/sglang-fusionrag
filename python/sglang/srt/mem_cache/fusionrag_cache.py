@@ -1111,14 +1111,16 @@ class FusionragCache(RadixCache):
             "kv_shape": list(kv_cache.shape),
             "layer_num": self.kv_cache.layer_num,
         }
-        ## 同步执行环境，不存在锁的问题
-        cache_key_material = text_without_prefix or json.dumps(
+        # key 始终包含业务标识与 token ids，避免“相同文本但不同 doc/chunk”互相覆盖。
+        cache_key_material = json.dumps(
             {
                 "variant": variant,
                 "doc_id": action_metadata.get("doc_id"),
                 "chunk_id": action_metadata.get("chunk_id"),
                 "doc_hash": action_metadata.get("doc_hash"),
                 "text_without_prefix_ids": text_without_prefix_ids,
+                # 保留文本字段用于调试可读性，不作为唯一区分条件。
+                "text": text_without_prefix,
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -1126,21 +1128,21 @@ class FusionragCache(RadixCache):
         md5_hash = hashlib.md5(cache_key_material.encode("utf-8")).hexdigest()
         if variant == "preprocess":
             passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
-            logger.error(
+            logger.info(
                 "save to PREPROCESS cache\n"
                 f"text=\n{text_without_prefix}\n"
                 f"prefix=\n{prefix_prompt}"
             )
         elif variant == "raw":
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
-            logger.error(
+            logger.info(
                 "save to RAW cache\n"
                 f"text=\n{text_without_prefix[:20]}\n"
                 f"prefix=\n{prefix_prompt}"
             )
         else:
             raise ValueError(f"unsupported cache save variant: {variant}")
-        logger.error(f"cache save path: {passage_kv_path}")
+        logger.info("cache save path: %s", passage_kv_path)
         os.makedirs(passage_kv_path, exist_ok=True)
         ready_path = f"{passage_kv_path}/{_CACHE_READY_SENTINEL}"
         metadata_file_path = f"{passage_kv_path}/metadata.json"
