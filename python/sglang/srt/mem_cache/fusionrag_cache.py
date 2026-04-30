@@ -11,6 +11,7 @@ import torch
 import os, copy
 from typing import Any
 import hashlib
+import uuid
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
@@ -1146,9 +1147,10 @@ class FusionragCache(RadixCache):
         os.makedirs(passage_kv_path, exist_ok=True)
         ready_path = f"{passage_kv_path}/{_CACHE_READY_SENTINEL}"
         metadata_file_path = f"{passage_kv_path}/metadata.json"
-        tmp_metadata_path = f"{metadata_file_path}.tmp"
+        tmp_suffix = f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        tmp_metadata_path = f"{metadata_file_path}{tmp_suffix}"
         tensor_file_path = f"{passage_kv_path}/{md5_hash}.pt"
-        tmp_tensor_file_path = f"{tensor_file_path}.tmp"
+        tmp_tensor_file_path = f"{tensor_file_path}{tmp_suffix}"
 
         # 两阶段提交：
         # 1) 先删除旧 ready，写入 tmp 文件；
@@ -1160,8 +1162,14 @@ class FusionragCache(RadixCache):
         with open(tmp_metadata_path, 'w') as f:
             json.dump(metadata, f)
         torch.save(kv_cache, tmp_tensor_file_path)
-        os.replace(tmp_metadata_path, metadata_file_path)
-        os.replace(tmp_tensor_file_path, tensor_file_path)
+        try:
+            os.replace(tmp_metadata_path, metadata_file_path)
+            os.replace(tmp_tensor_file_path, tensor_file_path)
+        except FileNotFoundError:
+            # 多 TP 并发写相同 cache key 时，其他进程可能已经完成提交并清理了本进程
+            # 期望替换的临时文件；若最终目标文件存在，则视为成功提交。
+            if not (os.path.exists(metadata_file_path) and os.path.exists(tensor_file_path)):
+                raise
         with open(ready_path, "w", encoding="utf-8") as f:
             f.write("1")
 
