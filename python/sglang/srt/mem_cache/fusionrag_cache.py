@@ -1185,6 +1185,7 @@ class FusionragCache(RadixCache):
         tmp_metadata_path = f"{metadata_file_path}{tmp_suffix}"
         tensor_file_path = f"{passage_kv_path}/{md5_hash}.pt"
         tmp_tensor_file_path = f"{tensor_file_path}{tmp_suffix}"
+        tmp_ready_path = f"{ready_path}{tmp_suffix}"
 
         # 两阶段提交：
         # 1) 先删除旧 ready，写入 tmp 文件；
@@ -1192,7 +1193,11 @@ class FusionragCache(RadixCache):
         # 3) 最后写 ready，表示可被加载。
         # 读取方只认 ready，从而避免读到部分写入结果。
         if os.path.exists(ready_path):
-            os.remove(ready_path)
+            try:
+                os.remove(ready_path)
+            except FileNotFoundError:
+                # 多 TP 并发写相同 cache key 时，ready 可能已被其他进程先一步删除。
+                pass
         with open(tmp_metadata_path, 'w') as f:
             json.dump(metadata, f)
         torch.save(kv_cache, tmp_tensor_file_path)
@@ -1204,8 +1209,9 @@ class FusionragCache(RadixCache):
             # 期望替换的临时文件；若最终目标文件存在，则视为成功提交。
             if not (os.path.exists(metadata_file_path) and os.path.exists(tensor_file_path)):
                 raise
-        with open(ready_path, "w", encoding="utf-8") as f:
+        with open(tmp_ready_path, "w", encoding="utf-8") as f:
             f.write("1")
+        os.replace(tmp_ready_path, ready_path)
 
     def dec_lock_ref(self, node: ChunkNode):
         ""

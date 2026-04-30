@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import pytest
 
 from sglang.srt.fusionrag_params import (
@@ -257,3 +260,51 @@ def test_compute_extend_logprob_pruned_lens_uses_input_lens_not_compute_lens():
 
     assert extend_return_logprob is False
     assert pruned_lens == [0]
+
+
+def test_write_cache_to_disk_tolerates_ready_remove_race(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
+
+    class DummyKVCache:
+        layer_num = 1
+
+        def get_key_buffer(self, layer_id):
+            assert layer_id == 0
+            return torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    class DummyReq:
+        origin_input_text = "prefix body"
+        prefix_prompt = "prefix "
+        fusionrag_plan = None
+
+    cache = object.__new__(FusionragCache)
+    cache.kv_cache = DummyKVCache()
+    cache.cache_path = str(tmp_path / "raw")
+    cache.preprocess_cache_path = str(tmp_path / "preprocess")
+
+    cache_dir = Path(cache.cache_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    original_remove = os.remove
+
+    def flaky_remove(path):
+        if path.endswith("/.ready"):
+            raise FileNotFoundError(path)
+        return original_remove(path)
+
+    monkeypatch.setattr(os, "remove", flaky_remove)
+
+    req = DummyReq()
+    kv_indices = torch.tensor([0, 1], dtype=torch.long)
+    text_without_prefix_ids = [10, 11]
+
+    cache._write_cache_to_disk(req, kv_indices, 0, text_without_prefix_ids, "raw")
+
+    entry_dirs = list(cache_dir.iterdir())
+    assert len(entry_dirs) == 1
+    entry_dir = entry_dirs[0]
+    assert (entry_dir / ".ready").exists()
+    assert (entry_dir / "metadata.json").exists()
+    assert list(entry_dir.glob("*.pt"))
