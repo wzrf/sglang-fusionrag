@@ -158,6 +158,31 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
 
+    @staticmethod
+    def _remap_loaded_chunk_rope_positions(req: Req) -> None:
+        """Map loaded chunk KV positions from saved-local space to request-global space.
+
+        Save-side convention: chunk KV is persisted as a local span starting from 0.
+        Load-side convention: remap to plan span `[start_token, end_token)` for this request.
+        """
+        values_list = getattr(req, "hit_chunk_values", None)
+        chunk_plan = getattr(req, "hit_chunk_plan", None)
+        if not values_list or not chunk_plan:
+            return
+
+        for hit_value, plan in zip(values_list, chunk_plan):
+            if hit_value is None or getattr(hit_value, "value", None) is None:
+                continue
+            chunk_len = int(hit_value.value.shape[0])
+            start_token = int(getattr(plan, "start_token", 0))
+            device = hit_value.value.device
+            hit_value.original_position = torch.arange(
+                0, chunk_len, dtype=torch.int64, device=device
+            )
+            hit_value.current_position = torch.arange(
+                start_token, start_token + chunk_len, dtype=torch.int64, device=device
+            )
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
@@ -773,6 +798,7 @@ class PrefillAdder:
                         if len(req.prefix_indices) >= len(req.fill_ids):
                             req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
                         req.hit_chunk_values = values_list
+                        self._remap_loaded_chunk_rope_positions(req)
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
                         req.cache_protected_len = prefix_len
@@ -789,6 +815,7 @@ class PrefillAdder:
                         if len(req.prefix_indices) >= len(req.fill_ids):
                             req.prefix_indices = req.prefix_indices[:len(req.fill_ids)-1]
                         req.hit_chunk_values = values_list
+                        self._remap_loaded_chunk_rope_positions(req)
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
                         ## 把fusionrag cache视作decode出来的内容，不然这显存部分释放不掉
@@ -814,6 +841,7 @@ class PrefillAdder:
                         if len(req.prefix_indices) >= len(req.fill_ids):
                             req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
                         req.hit_chunk_values = values_list
+                        self._remap_loaded_chunk_rope_positions(req)
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
                         req.cache_protected_len = prefix_len
