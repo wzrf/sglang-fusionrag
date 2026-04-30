@@ -1699,6 +1699,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         recompute_cache_indices = []
         compute_positions = []
+        use_sparse_compute_positions = False
         for r in reqs:
             r.apply_fusionrag_runtime_guards()
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
@@ -1709,6 +1710,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.all_compute_idx = sorted(set(r.all_compute_idx))
             r.extend_compute_len = len(r.all_compute_idx)
             compute_positions.append(r.all_compute_idx)
+            if r.recompute_idx or r.fusionrag_plan is not None:
+                use_sparse_compute_positions = True
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
             logger.debug(
@@ -1772,7 +1775,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.alloc_extend_lens = alloc_extend_lens
-        self.compute_positions = compute_positions
+        self.compute_positions = compute_positions if use_sparse_compute_positions else None
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens

@@ -449,6 +449,43 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
+    if compute_positions is None:
+        # Keep ordinary prefix-cache requests on the original contiguous tail path.
+        # Sparse placement is only needed for FusionRAG/recompute requests.
+        if batch.tree_cache_hicache.page_size == 1:
+            out_cache_loc = alloc_token_slots(
+                batch.tree_cache_hicache, batch.extend_num_tokens
+            )
+        else:
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache_hicache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+            )
+
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
+        return out_cache_loc, req_pool_indices_device, req_pool_indices
+
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache_hicache.page_size == 1:
         # Build out_cache_loc strictly aligned with compute_positions.
