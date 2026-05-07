@@ -31,7 +31,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
-
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -767,7 +767,8 @@ class PrefillAdder:
                     ## this is a kv gen task, didn't use prefix cache.
                     if req.last_host_node is None:
                         new_indices, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
-                            req.hit_chunk_nodes
+                            req.hit_chunk_nodes,
+                            self.tree_cache_hicache
                         )
                         req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                         if len(req.prefix_indices) >= len(req.fill_ids):
@@ -781,9 +782,19 @@ class PrefillAdder:
                             req.last_host_node, req.host_hit_length_hicache
                         )
                         new_indices_fusionrag, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
-                            req.hit_chunk_nodes
+                            req.hit_chunk_nodes,
+                            self.tree_cache_hicache
                         )
                         prefix_indices_hicache = torch.cat([req.prefix_indices, new_indices_hicache])
+                        ## 前缀不一定都匹配上了。
+                        if len(prefix_indices_hicache) < len(req.prefix_cache_ids):
+                            length_diff = len(req.prefix_cache_ids) - len(prefix_indices_hicache)
+                            diff_cache_loc = alloc_token_slots(self.tree_cache_hicache, length_diff)
+                            new_indices_hicache = torch.cat([new_indices_hicache, diff_cache_loc])
+                            req.recompute_idx[:0] =range(len(prefix_indices_hicache), len(req.prefix_cache_ids))
+                            req.recompute_idx = sorted(set(req.recompute_idx))
+                            prefix_indices_hicache = torch.cat([req.prefix_indices, new_indices_hicache])
+
                         req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache, new_indices_fusionrag])
                         if len(req.prefix_indices) >= len(req.fill_ids):
                             req.prefix_indices = req.prefix_indices[:len(req.fill_ids)-1]
@@ -804,7 +815,8 @@ class PrefillAdder:
                         req.cache_protected_len = prefix_len
                     else:
                         new_indices, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
-                            req.hit_chunk_nodes
+                            req.hit_chunk_nodes,
+                            None
                         )
                         req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                         if len(req.prefix_indices) >= len(req.fill_ids):

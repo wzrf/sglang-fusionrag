@@ -2,6 +2,7 @@ from __future__ import annotations
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.mem_cache.common import alloc_token_slots
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -951,6 +952,7 @@ class Req(ReqDllmMixin):
                 self.no_need_to_run = True
         else:
             if len(self.prefix_cache_ids) > 0:
+                print(f"[hiradix cache] req prefix_cache_ids length = {len(self.prefix_cache_ids)}")
                 token_ids = self.fill_ids[:len(self.prefix_cache_ids)]
             match_result_prefix = tree_cache_hicache.match_prefix(
                 MatchPrefixParams(
@@ -981,6 +983,7 @@ class Req(ReqDllmMixin):
                 match_result_prefix.host_hit_length,
                 match_result_prefix.mamba_branching_seqlen,
             )
+            print(f"[hiradix cache] req prefix_indices_hicache length = {len(self.prefix_indices_hicache)}, host_hit_length_hicache={self.host_hit_length_hicache}")
             self.cache_protected_len = len(self.prefix_indices_hicache)
 
             match_result_fusionrag = tree_cache_fusionrag.match_prefix(
@@ -1005,6 +1008,8 @@ class Req(ReqDllmMixin):
 
             self.prefix_indices = self.prefix_indices_hicache ## mengyao_debug: in fusionrag cache this is empty.
             self.host_hit_length = self.host_hit_length_fusionrag + self.host_hit_length_hicache
+            print(
+                f"[fusionrag cache] req host_hit_length length={self.host_hit_length_fusionrag}")
 
 
         if (

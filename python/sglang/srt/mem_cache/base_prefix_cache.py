@@ -191,7 +191,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back_chunk(
         self,
-        all_hit_nodes: Any
+        all_hit_nodes: Any,
+        hicache: BasePrefixCache,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.

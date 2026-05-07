@@ -13,7 +13,7 @@ from typing import Any
 import hashlib
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult, BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -517,11 +517,14 @@ class FusionragCache(RadixCache):
 
 
     def load_back(
-        self, nodes_to_load: List[ChunkNode], mem_quota: Optional[int] = None
+        self, nodes_to_load: List[ChunkNode], hicache: BasePrefixCache,
+        mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor, list[torch.Tensor]]:
         # todo: more loading policies
 
         start_time = time.perf_counter()
+        for n in nodes_to_load:
+            print(f"[load_back] text_without_prefix={n.text_without_prefix}, host_value={n.host_value}")
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         last_hit_node = nodes_to_load[-1]
         ancester_node = nodes_to_load[0]
@@ -529,12 +532,16 @@ class FusionragCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
+        ##debug to see if this is working
+        # hicache.evict(EvictParams(num_tokens=0))
         if device_indices is None:
             print(f"not enough HBM to load")
-            self.evict(len(host_indices))
-            device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
-            )
+            if hicache is not None:
+                print(f"try borrow from hicache")
+                hicache.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices, node_id=last_hit_node.id
+                )
         if device_indices is None:
             raise Exception(f"not enough HBM to load")
             # no sufficient GPU memory to load back KV caches
@@ -566,9 +573,10 @@ class FusionragCache(RadixCache):
     def init_load_back_chunk(
         self,
         all_hit_nodes: List[ChunkNode],
+        hicache: BasePrefixCache,
     ):
         loading_values, values_list = self.load_back(
-            all_hit_nodes,
+            all_hit_nodes, hicache,
         )
         return loading_values, values_list
         ""

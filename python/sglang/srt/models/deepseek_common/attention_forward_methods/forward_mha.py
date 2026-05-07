@@ -291,10 +291,10 @@ class DeepseekMHAForwardMixin:
                     torch.set_printoptions(threshold=1000)
                     if has_duplicates(kv_indices):
                         torch.set_printoptions(threshold=10000)
-                        print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, "
-                              f"req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
+                        print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, ")
+                        # print(f"mengyao_debug req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
                         torch.set_printoptions(threshold=1000)
-                        raise "HAS DUPLICATES"
+                        # raise "HAS DUPLICATES" ## it's normal for agent case, when they have common prefix.
                     if has_duplicates(forward_batch.out_cache_loc):
                         torch.set_printoptions(threshold=10000)
                         print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
