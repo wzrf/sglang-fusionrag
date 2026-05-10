@@ -548,8 +548,8 @@ class Req(ReqDllmMixin):
         self.use_chunk_node: bool = False ##mengyao_debug hardcode
         self.use_mix_prefix_cache: bool = True
         self.prefix_cache_ids: List[int] = []
-        self.hit_chunk_nodes: Any = None
-        self.hit_chunk_values: Any = None
+        self.hit_chunk_nodes: Any = []
+        self.hit_chunk_values: Any = []
         self.recompute_idx: List[int] = []
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
@@ -1567,6 +1567,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if len(r.prefix_indices) >0:
                 print(f"mengyao_debug recompute percentage="
                       f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
+                torch.set_printoptions(threshold=10000)
+                print(f"mengyao_debug prefix_indices={r.prefix_indices}")
+                torch.set_printoptions(threshold=1000)
             else:
                 print(f"mengyao_debug compute percentage=100%")
             # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")

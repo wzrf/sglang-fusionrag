@@ -504,6 +504,7 @@ class RadixCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        return
         if self.disable:
             return
 

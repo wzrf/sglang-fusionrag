@@ -517,10 +517,11 @@ class FusionragCache(RadixCache):
 
 
     def load_back(
-        self, nodes_to_load: List[ChunkNode], hicache: BasePrefixCache,
+        self, nodes_to_load: List[ChunkNode], hicache: BasePrefixCache, prefix_cache_ids_len: int,
         mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor, list[torch.Tensor]]:
         # todo: more loading policies
+        print(f"nodes_to_load len = {len(nodes_to_load)}")
 
         start_time = time.perf_counter()
         for n in nodes_to_load:
@@ -554,7 +555,9 @@ class FusionragCache(RadixCache):
             all_values.append(
                 HitCacheNode(
                     value=device_hit_index,
-                    current_position=torch.arange(offset, offset + len(node.host_value)).to(device_hit_index.device),
+                    current_position=torch.arange(prefix_cache_ids_len + offset,
+                                                  prefix_cache_ids_len + offset + len(node.host_value)).to(
+                        device_hit_index.device),
                     original_position=torch.arange(node.cache_prefix_token_len,
                                                    node.cache_prefix_token_len + len(node.host_value)).to(device_hit_index.device),
                 )
@@ -570,13 +573,9 @@ class FusionragCache(RadixCache):
         # return device_indices[:-1], all_values ## left one just for decode
         return device_indices, all_values  ## mengyao_debug hardcode
 
-    def init_load_back_chunk(
-        self,
-        all_hit_nodes: List[ChunkNode],
-        hicache: BasePrefixCache,
-    ):
+    def init_load_back_chunk(self, all_hit_nodes: List[ChunkNode], hicache: BasePrefixCache, prefix_cache_ids_len: int):
         loading_values, values_list = self.load_back(
-            all_hit_nodes, hicache,
+            all_hit_nodes, hicache, prefix_cache_ids_len
         )
         return loading_values, values_list
         ""
