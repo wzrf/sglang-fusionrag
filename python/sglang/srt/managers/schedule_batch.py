@@ -1564,12 +1564,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a KV GEN TASK")
             else:
                 print(f"mengyao_debug This is a DECODER TASK")
-            if len(r.prefix_indices) >0:
+            if r.host_hit_length_fusionrag >0:
                 print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
-                torch.set_printoptions(threshold=10000)
-                print(f"mengyao_debug prefix_indices={r.prefix_indices}")
-                torch.set_printoptions(threshold=1000)
+                      f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
+                # torch.set_printoptions(threshold=10000)
+                print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
+                # torch.set_printoptions(threshold=1000)
             else:
                 print(f"mengyao_debug compute percentage=100%")
             # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")

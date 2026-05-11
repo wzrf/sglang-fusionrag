@@ -779,17 +779,23 @@ class PrefillAdder:
                         new_indices_hicache, req.last_node = self.tree_cache_hicache.init_load_back(
                             req.last_host_node, req.host_hit_length_hicache
                         )
-                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache])
+
                         prefix_indices_hicache = torch.cat([req.prefix_indices, new_indices_hicache])
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache])
+                        ## 把fusionrag cache和 prefix到fusionrag开始的这个gap 都视作decode出来的内容，不然这显存部分释放不掉
+                        req.cache_protected_len = len(prefix_indices_hicache)
 
                         if req.hit_chunk_nodes is not None and len(req.hit_chunk_nodes) > 0:
                             new_indices_fusionrag, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
                                 req.hit_chunk_nodes, self.tree_cache_hicache, len(req.prefix_cache_ids))
                             ## 前缀不一定都匹配上了。如果没有匹配上的话，hicache和fusionragcache中间的部分要重算
+                            ## 这部分算作prefix cache（要重算的prefix cache），但是不算在cache_protected_len里面
                             if len(prefix_indices_hicache) < len(req.prefix_cache_ids):
                                 length_diff = len(req.prefix_cache_ids) - len(prefix_indices_hicache)
                                 diff_cache_loc = alloc_token_slots(self.tree_cache_hicache, length_diff)
-                                new_indices_hicache = torch.cat([new_indices_hicache, diff_cache_loc])
+                                req.prefix_indices = torch.cat([req.prefix_indices, diff_cache_loc])
+                                print(f"[fusionrag gap] length_diff={length_diff}, diff_cache_loc={diff_cache_loc},"
+                                      f"prefix_indices_hicache={len(prefix_indices_hicache)}, prefix_cache_ids={len(req.prefix_cache_ids)}")
                                 req.recompute_idx[:0] =range(len(prefix_indices_hicache), len(req.prefix_cache_ids))
                                 req.recompute_idx = sorted(set(req.recompute_idx))
                             req.hit_chunk_values = values_list
@@ -799,8 +805,7 @@ class PrefillAdder:
                             req.prefix_indices = req.prefix_indices[:len(req.fill_ids)-1]
                         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                         prefix_len = len(req.prefix_indices)
-                        ## 把fusionrag cache视作decode出来的内容，不然这显存部分释放不掉
-                        req.cache_protected_len = len(prefix_indices_hicache)
+
 
                 else:
                     if not req.use_chunk_node:

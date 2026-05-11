@@ -658,7 +658,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 highlighted_tokens.append(f"\033[1;31m{token}\033[0m")  # 红色高亮
             else:
                 highlighted_tokens.append(token)
-        highlighted_with_spaces = "".join(highlighted_tokens)
+        highlighted_with_spaces = "".join(highlighted_tokens[1:])
         print(f"mengyao_debug highlight_recompute_tokens=\n{highlighted_with_spaces}")
 
 
