@@ -769,6 +769,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prefix_cache_ids"] = prefix_cache_ids
                 else:
                     obj.fusionrag_params["prefix_cache_ids"] = []
+                prefix_cache_ids_len = len(obj.fusionrag_params["prefix_cache_ids"])
 
                 if "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(
@@ -787,6 +788,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         recompute_length = int(len(input_ids) * recompute_rate)
                         numbers = random.sample(range(length), recompute_length)
                         numbers.sort()
+                        ## if this is a debug, only recompute idx in fusionrag chunks
+                        numbers = [x for x in numbers if x >= prefix_cache_ids_len]
                         obj.fusionrag_params["recompute_idx"] = numbers
                     else:
                         obj.fusionrag_params["recompute_idx"] = [0]

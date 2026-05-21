@@ -551,6 +551,7 @@ class Req(ReqDllmMixin):
         self.hit_chunk_nodes: Any = []
         self.hit_chunk_values: Any = []
         self.recompute_idx: List[int] = []
+        self.recompute_idx_origin: List[int] = [] ## without gap
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
 
@@ -563,6 +564,7 @@ class Req(ReqDllmMixin):
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
+            self.recompute_idx_origin = copy.deepcopy(self.recompute_idx)
             self.save_raw_cache = not self.save_preprocess_cache
             self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
             self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
@@ -1566,7 +1568,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a DECODER TASK")
             if r.host_hit_length_fusionrag >0:
                 print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
+                      f"{len(r.recompute_idx_origin) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
                 # torch.set_printoptions(threshold=10000)
                 print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
                 # torch.set_printoptions(threshold=1000)

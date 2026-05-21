@@ -796,6 +796,7 @@ class PrefillAdder:
                                 req.prefix_indices = torch.cat([req.prefix_indices, diff_cache_loc])
                                 print(f"[fusionrag gap] length_diff={length_diff}, diff_cache_loc={diff_cache_loc},"
                                       f"prefix_indices_hicache={len(prefix_indices_hicache)}, prefix_cache_ids={len(req.prefix_cache_ids)}")
+                                print(f"matched prefix diff={req.prefix_cache_ids[-length_diff-20:]}")
                                 req.recompute_idx[:0] =range(len(prefix_indices_hicache), len(req.prefix_cache_ids))
                                 req.recompute_idx = sorted(set(req.recompute_idx))
                             req.hit_chunk_values = values_list

@@ -3011,6 +3011,8 @@ class DeepseekV2Model(nn.Module):
                                                        layer.self_attn.rotary_emb.cos_sin_cache,
                                                        wrong_positions=hit_chunk_node.original_position,
                                                        correct_positions=hit_chunk_node.current_position)
+                        # if layer_id == 0:
+                            # print(f"[fix_rope_test] fix rope_rotation, {hit_chunk_node.original_position} -> {hit_chunk_node.current_position}")
                         forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                             layer.self_attn.attn_mha,
                             device_indices,

@@ -364,6 +364,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        if len(output_strs) > 0:
+            print(f"[handle_batch_token_id_out] = {output_strs}")
         routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
