@@ -525,7 +525,7 @@ class FusionragCache(RadixCache):
 
         start_time = time.perf_counter()
         for n in nodes_to_load:
-            print(f"[load_back] text_without_prefix={n.text_without_prefix}, host_value={n.host_value}")
+            print(f"[load_back] text_without_prefix={n.text_without_prefix[:30]}, host_value={n.host_value}")
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         last_hit_node = nodes_to_load[-1]
         ancester_node = nodes_to_load[0]
@@ -663,7 +663,7 @@ class FusionragCache(RadixCache):
             node = ChunkNode()
             ## 不存储prefix部分
             node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
-            print(f"text_without_prefix = {node.text_without_prefix}")
+            print(f"text_without_prefix = {node.text_without_prefix[:30]}")
             node.prefix_text = key.prefix_prompt_text
             node.values = [value]
             node.priority = priority

@@ -1568,14 +1568,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a DECODER TASK")
             if r.host_hit_length_fusionrag >0:
                 print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx_origin) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
+                      f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
                 # torch.set_printoptions(threshold=10000)
                 print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
+                print(f"mengyao_debug recompute_idx_origin={r.recompute_idx_origin}")
+                print(f"mengyao_debug recompute_idx={r.recompute_idx}")
                 # torch.set_printoptions(threshold=1000)
             else:
                 print(f"mengyao_debug compute percentage=100%")
-            # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")
-            # print(f"r.fill_ids = {len(r.fill_ids)}")
+            print(f"r.all_compute_idx = {r.all_compute_idx}")
+            print(f"r.fill_ids = {len(r.fill_ids)}")
+            print(f"r.fill_ids recompute = {[r.fill_ids[i] for i in r.all_compute_idx]}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
 

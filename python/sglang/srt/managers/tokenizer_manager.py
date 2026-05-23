@@ -762,7 +762,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 prefix_prompt_ = obj.fusionrag_params["prefix_prompt"]
                 prompt_ = input_text
                 if not prompt_.startswith(prefix_prompt_) and prefix_prompt_ in prompt_:
-                    prefix_cache_prompt = prompt_[:prompt_.index(prefix_prompt_)]
+                    if "prefix_cache_prompt" in obj.fusionrag_params:
+                        prefix_cache_prompt = obj.fusionrag_params["prefix_cache_prompt"]
+                    else:
+                        ## 找到最后一个
+                        prefix_cache_prompt = prompt_[:prompt_.rfind(prefix_prompt_)]
+
                     prefix_cache_ids, _ = await self._tokenize_texts(
                         prefix_cache_prompt, is_cross_encoder_request
                     )
