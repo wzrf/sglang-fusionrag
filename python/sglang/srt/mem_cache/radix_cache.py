@@ -497,6 +497,9 @@ class RadixCache(BasePrefixCache):
             # Free the duplicates that were already in the tree
             ## mengyao_debug cache_protected_len之前是推理之前前缀匹配出来的，cache_protected_len 到 new_prefix_len是decode出来但是已经在prefix cache里面的；
             print(f"[cache_finished_req] new_prefix_len={new_prefix_len}")
+            print(f"[cache_finished_req] new insert ids 1 = {req.fill_ids[req.cache_protected_len : new_prefix_len]}")
+            print(f"[cache_finished_req] new insert origin_input_ids = {req.origin_input_ids[req.cache_protected_len:]}")
+            print(f"[cache_finished_req] new insert output_ids = {req.output_ids}")
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
