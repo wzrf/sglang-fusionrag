@@ -799,7 +799,6 @@ class FusionragCache(RadixCache):
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
-        tp_rank = get_attention_tp_rank()
         kv_cache = []
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
