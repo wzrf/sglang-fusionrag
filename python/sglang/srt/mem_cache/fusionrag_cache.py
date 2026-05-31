@@ -13,7 +13,7 @@ from typing import Any
 import hashlib
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult, BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
@@ -231,13 +231,13 @@ class FusionragCache(RadixCache):
 
         cache_path_root = "/mnt/data3"
         served_model_name = server_args.served_model_name
-        # if not os.path.exists(cache_path_root):
-        #     cache_path_root = "/mnt/data"
-        self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+        if not os.path.exists(cache_path_root):
+            cache_path_root = "/mnt/data"
+        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
+        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
@@ -292,6 +292,7 @@ class FusionragCache(RadixCache):
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[2]
             try:
+                ##fixme mengyao_debug: this is the qwen cache
                 if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[1]:
                     print(f"shape mismatch.")
                     continue
@@ -517,11 +518,15 @@ class FusionragCache(RadixCache):
 
 
     def load_back(
-        self, nodes_to_load: List[ChunkNode], mem_quota: Optional[int] = None
+        self, nodes_to_load: List[ChunkNode], hicache: BasePrefixCache, prefix_cache_ids_len: int,
+        mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor, list[torch.Tensor]]:
         # todo: more loading policies
+        print(f"nodes_to_load len = {len(nodes_to_load)}")
 
         start_time = time.perf_counter()
+        for n in nodes_to_load:
+            print(f"[load_back] text_without_prefix={n.text_without_prefix[:30]}, host_value={n.host_value}")
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         last_hit_node = nodes_to_load[-1]
         ancester_node = nodes_to_load[0]
@@ -529,12 +534,16 @@ class FusionragCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices, node_id=last_hit_node.id
         )
+        ##debug to see if this is working
+        # hicache.evict(EvictParams(num_tokens=0))
         if device_indices is None:
             print(f"not enough HBM to load")
-            self.evict(len(host_indices))
-            device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
-            )
+            if hicache is not None:
+                print(f"try borrow from hicache")
+                hicache.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices, node_id=last_hit_node.id
+                )
         if device_indices is None:
             raise Exception(f"not enough HBM to load")
             # no sufficient GPU memory to load back KV caches
@@ -547,7 +556,9 @@ class FusionragCache(RadixCache):
             all_values.append(
                 HitCacheNode(
                     value=device_hit_index,
-                    current_position=torch.arange(offset, offset + len(node.host_value)).to(device_hit_index.device),
+                    current_position=torch.arange(prefix_cache_ids_len + offset,
+                                                  prefix_cache_ids_len + offset + len(node.host_value)).to(
+                        device_hit_index.device),
                     original_position=torch.arange(node.cache_prefix_token_len,
                                                    node.cache_prefix_token_len + len(node.host_value)).to(device_hit_index.device),
                 )
@@ -563,12 +574,9 @@ class FusionragCache(RadixCache):
         # return device_indices[:-1], all_values ## left one just for decode
         return device_indices, all_values  ## mengyao_debug hardcode
 
-    def init_load_back_chunk(
-        self,
-        all_hit_nodes: List[ChunkNode],
-    ):
+    def init_load_back_chunk(self, all_hit_nodes: List[ChunkNode], hicache: BasePrefixCache, prefix_cache_ids_len: int):
         loading_values, values_list = self.load_back(
-            all_hit_nodes,
+            all_hit_nodes, hicache, prefix_cache_ids_len
         )
         return loading_values, values_list
         ""
@@ -656,7 +664,7 @@ class FusionragCache(RadixCache):
             node = ChunkNode()
             ## 不存储prefix部分
             node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
-            print(f"text_without_prefix = {node.text_without_prefix}")
+            print(f"text_without_prefix = {node.text_without_prefix[:30]}")
             node.prefix_text = key.prefix_prompt_text
             node.values = [value]
             node.priority = priority
@@ -767,15 +775,14 @@ class FusionragCache(RadixCache):
             self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
                                       prompt_ids_without_prefix) ## 不存储prefix部分
 
-        ## either case 都要把显存清理掉，要把output_ids部分也清理掉
-        kv_committed_len = req.pop_committed_kv_cache()
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
-        ##todo 这里有问题，prefix_len 设置成了0，所以只把alloc_extend申请的内存free掉了，但是prefix的内存没有free掉。
-        ##todo 还是把prefix_len改成对的吧
-        self.cache_controller.mem_pool_device_allocator.free(kv_indices)
+            ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
+            kv_committed_len = req.pop_committed_kv_cache()
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            self.cache_controller.mem_pool_device_allocator.free(kv_indices)
+
         for node_idx, node in enumerate(req.hit_chunk_nodes):
             value_to_remove = req.hit_chunk_values[node_idx].value
             try:
@@ -786,7 +793,7 @@ class FusionragCache(RadixCache):
             except Exception as E:
                 print(f"cache finish req error. E={E}, node={node}")
 
-        self.req_to_token_pool.free(req.req_pool_idx)
+        # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
         k_cache = []
@@ -798,6 +805,7 @@ class FusionragCache(RadixCache):
             v_cache.append(v_buffer)
         k_caches = torch.stack(k_cache, dim=0)
         v_caches = torch.stack(v_cache, dim=0)
+        ##fixme mengyao_debug: this is the qwen cache
         kv_cache = torch.stack([k_caches, v_caches], dim=0)
         text = req.origin_input_text
         prefix_prompt = req.prefix_prompt

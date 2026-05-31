@@ -1,3 +1,7 @@
+import functools
+from typing import Optional
+
+import torch
 
 from sglang.srt.utils import is_cuda
 
@@ -5,13 +9,9 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import silu_and_mul
+    from sgl_kernel.moe import moe_sum_reduce
 
-import functools
-from typing import Optional
-
-import torch
-from sgl_kernel.elementwise import silu_and_mul
-from sgl_kernel.moe import moe_sum_reduce
+    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -103,6 +103,18 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
 
+    # KT hybrid dispatch marks CPU-routed experts as -1 after remapping.
+    # Marlin expects expert ids in [0, E), so sanitize invalid ids and
+    # zero out their corresponding weights (GPU path should ignore them).
+    invalid_topk = (topk_ids < 0) | (topk_ids >= E)
+    topk_ids = torch.where(invalid_topk, torch.zeros_like(topk_ids), topk_ids)
+    topk_weights = torch.where(invalid_topk, torch.zeros_like(topk_weights), topk_weights)
+
+    # Early return when no experts on GPU (e.g. kt-num-gpu-experts=0)
+    # or no tokens to process. Avoids kernel launch failures with empty tensors.
+    if E == 0 or M == 0:
+        return torch.zeros_like(hidden_states)
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
@@ -155,7 +167,7 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     )
 
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
         w1,
@@ -174,7 +186,7 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type1.id,
+        b_q_type=scalar_type1,
         size_m=M,
         size_n=2 * N,
         size_k=K,
@@ -189,7 +201,7 @@ def fused_marlin_moe(
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
         w2,
@@ -208,7 +220,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type2.id,
+        b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
         size_k=N,

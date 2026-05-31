@@ -22,7 +22,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -271,27 +271,35 @@ class DeepseekMHAForwardMixin:
             forward_batch.mha_one_shot
             # and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+            if (
+                self.use_nsa
+                and self.kv_cache_dtype == "fp8_e4m3"
+                and (
+                    not get_global_server_args().nsa_decode_backend == "trtllm"
+                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
+                )
+            ):
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
                 if self.layer_id == 0:
+                    # torch.set_printoptions(threshold=10000)
                     print(f"mengyao_debug kv_indice={kv_indices}, shape={kv_indices.shape}")
-                    torch.set_printoptions(threshold=10000)
+                    print(f"mengyao_debug positions={positions}, shape={positions.shape}")
                     print(f"mengyao_debug out_cache_loc={forward_batch.out_cache_loc}, shape={forward_batch.out_cache_loc.shape}")
-                    torch.set_printoptions(threshold=1000)
+                    # torch.set_printoptions(threshold=1000)
                     if has_duplicates(kv_indices):
-                        torch.set_printoptions(threshold=10000)
-                        print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, "
-                              f"req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
-                        torch.set_printoptions(threshold=1000)
-                        raise "HAS DUPLICATES"
+                        # torch.set_printoptions(threshold=10000)
+                        print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, ")
+                        # print(f"mengyao_debug req_to_token={forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices][:forward_batch.seq_lens]}")
+                        # torch.set_printoptions(threshold=1000)
+                        # raise "HAS DUPLICATES" ## it's normal for agent case, when they have common prefix.
                     if has_duplicates(forward_batch.out_cache_loc):
-                        torch.set_printoptions(threshold=10000)
+                        # torch.set_printoptions(threshold=10000)
                         print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
-                        torch.set_printoptions(threshold=1000)
+                        # torch.set_printoptions(threshold=1000)
                         raise "HAS DUPLICATES"
                 kv_a, k_pe = self._get_mla_kv_buffer(
                     forward_batch.fetch_mha_one_shot_kv_indices(),
@@ -707,7 +715,12 @@ class DeepseekMHAForwardMixin:
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
+        elif (
+            _is_cuda
+            and next_power_of_2(self.num_local_heads) == self.num_local_heads
+            and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
+            and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+        ):
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"

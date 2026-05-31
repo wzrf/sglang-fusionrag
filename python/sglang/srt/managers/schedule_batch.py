@@ -1,9 +1,8 @@
 from __future__ import annotations
-
-import enum
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.mem_cache.common import alloc_token_slots
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,11 +39,11 @@ import copy
 import dataclasses
 import logging
 import re
-import time
 from enum import Enum, auto
+from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -56,6 +55,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -69,15 +69,19 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.metrics.collector import (
-    DPCooperationInfo,
-    SchedulerMetricsCollector,
-    TimeStats,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+)
+from sglang.srt.observability.metrics_collector import (
+    DPCooperationInfo,
+    SchedulerMetricsCollector,
+)
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -89,13 +93,32 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Constant used as the base offset for MM (multimodal) pad values.
+# This ensures pad_values don't overlap with valid text token IDs.
+MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
+
+
+def _compute_pad_value(hash: int) -> int:
+    """Compute pad value from hash."""
+    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
 class BaseFinishReason:
@@ -261,7 +284,7 @@ class MultimodalDataItem:
             import uuid
 
             self.hash = uuid.uuid4().int
-            self.pad_value = self.hash % (1 << 30)
+            self.pad_value = _compute_pad_value(self.hash)
             return
         if self.hash is None:
             if self.feature is not None:
@@ -270,7 +293,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -458,36 +481,7 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
-class RequestStage(str, enum.Enum):
-    # Tokenizer
-    TOKENIZE = "tokenize"
-    TOKENIZER_DISPATCH = "dispatch"
-
-    # DP controller
-    DC_DISPATCH = "dc_dispatch"
-
-    # common/non-disaggregation
-    PREFILL_WAITING = "prefill_waiting"
-    REQUEST_PROCESS = "request_process"
-    DECODE_LOOP = "decode_loop"
-    PREFILL_FORWARD = "prefill_forward"
-    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
-
-    # disaggregation prefill
-    PREFILL_PREPARE = "prefill_prepare"
-    PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
-
-    # disaggregation decode
-    DECODE_PREPARE = "decode_prepare"
-    DECODE_BOOTSTRAP = "decode_bootstrap"
-    DECODE_WAITING = "decode_waiting"
-    DECODE_TRANSFERRED = "decode_transferred"
-    DECODE_FAKE_OUTPUT = "fake_output"
-    DECODE_QUICK_FINISH = "quick_finish"
-
-
-class Req:
+class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -515,7 +509,8 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
-        data_parallel_rank: Optional[int] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -524,6 +519,9 @@ class Req:
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         fusionrag_params: Optional[Dict] = None,
+        time_stats: Optional[
+            Union[APIServerReqTimeStats, DPControllerReqTimeStats]
+        ] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -547,10 +545,13 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        self.use_chunk_node: bool = True ##mengyao_debug hardcode
-        self.hit_chunk_nodes: Any = None
-        self.hit_chunk_values: Any = None
+        self.use_chunk_node: bool = False ##mengyao_debug hardcode
+        self.use_mix_prefix_cache: bool = True
+        self.prefix_cache_ids: List[int] = []
+        self.hit_chunk_nodes: Any = []
+        self.hit_chunk_values: Any = []
         self.recompute_idx: List[int] = []
+        self.recompute_idx_origin: List[int] = [] ## without gap
         ## ## all the index needs to compute, including the recompute index and the postfix.
         self.all_compute_idx: List[int] = []
 
@@ -563,11 +564,13 @@ class Req:
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
+            self.recompute_idx_origin = copy.deepcopy(self.recompute_idx)
             self.save_raw_cache = not self.save_preprocess_cache
             self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
             self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
             self.prefix_prompt_ids_list = fusionrag_params.get("prefix_prompt_ids_list", [])
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
+            self.prefix_cache_ids = fusionrag_params.get("prefix_cache_ids", [])
             #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
             if self.is_kv_gen and self.save_preprocess_cache:
                 self.use_preprocess_cache = False
@@ -672,6 +675,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_indices_hicache: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_indices_fusionrag: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -679,6 +684,10 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.host_hit_length_hicache = 0
+        self.host_hit_length_fusionrag = 0
+        # Tokens loaded from storage backend (L3) during prefetch for this request
+        self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
@@ -770,6 +779,14 @@ class Req:
         self.cached_tokens = 0
         self.already_computed = 0
 
+        # Detailed breakdown of cached tokens by source (for HiCache)
+        self.cached_tokens_device = 0  # Tokens from device cache (GPU)
+        self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
+        self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
+
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
@@ -778,15 +795,24 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # Acceptance histogram for speculative decoding.
+        # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+        # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+        self.spec_acceptance_histogram: List[int] = []
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
 
-        # For metrics
+        # For observability
         self.metrics_collector = metrics_collector
-        self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
+        if time_stats is not None:
+            self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
+        else:
+            self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
+        self.time_stats.set_metrics_collector(metrics_collector)
+        self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
-        self.last_tic = time.monotonic()
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -794,8 +820,8 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # For data parallel rank routing
-        self.data_parallel_rank: Optional[int] = data_parallel_rank
+        self.routed_dp_rank: Optional[int] = routed_dp_rank
+        self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -817,6 +843,7 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.init_diffusion_llm(dllm_config)
         if fusionrag_params is not None:
             self.fusionrag_params=fusionrag_params
         else:
@@ -862,15 +889,17 @@ class Req:
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
-    def add_latency(self, stage: RequestStage):
-        if self.metrics_collector is None:
-            return
+    def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
+        """Update the speculative decoding acceptance histogram.
 
-        now = time.monotonic()
-        self.metrics_collector.observe_per_stage_req_latency(
-            stage.value, now - self.last_tic
-        )
-        self.last_tic = now
+        Args:
+            accepted_draft_tokens: Number of draft tokens accepted in this step.
+        """
+        if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
+            self.spec_acceptance_histogram.extend(
+                [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
+            )
+        self.spec_acceptance_histogram[accepted_draft_tokens] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -882,23 +911,11 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def is_dllm(self):
-        return self.dllm_config is not None
-
-    def _init_fill_ids_for_dllm(self):
-        if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
-        else:
-            self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
-        self.fill_ids = self.dllm_ids
-
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(self, tree_cache_hicache: Optional[BasePrefixCache] = None,
+                              tree_cache_fusionrag: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
+            self.determine_dllm_phase()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -911,12 +928,9 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
 
-        if not self.is_kv_gen:
-            print(f"debug")
-
-        ## fixme: I delete tree cache
-        if tree_cache is not None:
-            match_result = tree_cache.match_prefix(
+        ## if it's kv gen, only use fusion rag cache.
+        if self.is_kv_gen:
+            match_result = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
                     # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
                     key=RadixKey(token_ids=token_ids,
@@ -928,35 +942,77 @@ class Req:
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
                                  prefix_prompt_ids_list=self.prefix_prompt_ids_list
                                  ),
-                    req=self if tree_cache.supports_mamba() else None,
-                    cow_mamba=tree_cache.supports_mamba(),
+                    req=self if tree_cache_fusionrag.supports_mamba() else None,
+                    cow_mamba=tree_cache_fusionrag.supports_mamba(),
                 ),
             )
-            if not self.is_kv_gen:
-                print(f"host_hit_len={match_result.host_hit_length}, prefix_len={self.kv_gen_prefix_len}")
-            if self.use_chunk_node:
-                self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
-                self.host_hit_length = match_result.host_hit_length
-                self.prefix_indices = match_result.device_indices ## empty
-                if match_result.no_need_to_run:
-                    print(f"req doesn't need to be run.")
-                    self.no_need_to_run = True
+            self.hit_chunk_nodes = match_result.all_hit_chunk_nodes
+            self.host_hit_length = match_result.host_hit_length
+            self.prefix_indices = match_result.device_indices  ## empty
+            if match_result.no_need_to_run:
+                print(f"req doesn't need to be run.")
+                self.no_need_to_run = True
+        else:
+            if len(self.prefix_cache_ids) > 0:
+                print(f"[hiradix cache] req prefix_cache_ids length = {len(self.prefix_cache_ids)}")
+                token_ids = self.fill_ids[:len(self.prefix_cache_ids)]
+            match_result_prefix = tree_cache_hicache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text,
+                                 prefix_prompt_text=self.prefix_prompt,
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 ),
+                    req=self if tree_cache_hicache.supports_mamba() else None,
+                    cow_mamba=tree_cache_hicache.supports_mamba(),
+                ),
+            )
 
-            else:
-                (
-                    self.prefix_indices,
-                    self.last_node,
-                    self.last_host_node,
-                    self.host_hit_length,
-                    self.mamba_branching_seqlen,
-                ) = (
-                    match_result.device_indices,
-                    match_result.last_device_node,
-                    match_result.last_host_node,
-                    match_result.host_hit_length,
-                    match_result.mamba_branching_seqlen,
-                )
-                self.cache_protected_len = len(self.prefix_indices)
+            (
+                self.prefix_indices_hicache,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length_hicache,
+                self.mamba_branching_seqlen,
+            ) = (
+                match_result_prefix.device_indices,
+                match_result_prefix.last_device_node,
+                match_result_prefix.last_host_node,
+                match_result_prefix.host_hit_length,
+                match_result_prefix.mamba_branching_seqlen,
+            )
+            print(f"[hiradix cache] req prefix_indices_hicache length = {len(self.prefix_indices_hicache)}, host_hit_length_hicache={self.host_hit_length_hicache}")
+            self.cache_protected_len = len(self.prefix_indices_hicache)
+
+            match_result_fusionrag = tree_cache_fusionrag.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text, ## todo mengyao_debug 这里不用改，用不到
+                                 prefix_prompt_text=self.prefix_prompt, ## todo mengyao_debug 这里需要改，改成从chunk位置开始匹配
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 ),
+                    req=self if tree_cache_hicache.supports_mamba() else None,
+                    cow_mamba=tree_cache_hicache.supports_mamba(),
+                ),
+            )
+
+            self.hit_chunk_nodes = match_result_fusionrag.all_hit_chunk_nodes
+            self.host_hit_length_fusionrag = match_result_fusionrag.host_hit_length
+            self.prefix_indices_fusionrag = match_result_fusionrag.device_indices  ## empty, will be assigned at add_one_req later.
+
+            self.prefix_indices = self.prefix_indices_hicache ## mengyao_debug: in fusionrag cache this is empty.
+            self.host_hit_length = self.host_hit_length_fusionrag + self.host_hit_length_hicache
+            print(
+                f"[fusionrag cache] req host_hit_length length={self.host_hit_length_fusionrag}")
+
 
         if (
             self.is_retracted
@@ -999,15 +1055,17 @@ class Req:
     def tail_str(self) -> str:
         # Check stop strings and stop regex patterns together
         if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
+            len(self.sampling_params.stop_strs) == 0
+            and len(self.sampling_params.stop_regex_strs) == 0
         ):
-            max_len_tail_str = max(
-                self.sampling_params.stop_str_max_len + 1,
-                self.sampling_params.stop_regex_max_len + 1,
-            )
+            return ""
 
-        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+
+        tail_len = min(max_len_tail_str, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1146,7 +1204,6 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
-        self.customized_info = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1164,6 +1221,9 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1231,62 +1291,6 @@ class Req:
         )
 
 
-class DllmStagingReqs:
-    def __init__(self, dllm_config: Optional[DllmConfig] = None):
-        self.dllm_config = dllm_config
-        self.max_running_reqs = (
-            dllm_config.max_running_requests if dllm_config is not None else 1
-        )
-        self.reqs: List[Req] = []
-
-    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
-        assert self.dllm_config is not None, "Diffusion LLM config is not set."
-
-        if isinstance(req, DllmStagingReqs):
-            reqs_to_add = req.reqs
-        elif isinstance(req, list):
-            reqs_to_add = req
-        else:
-            reqs_to_add = [req]
-
-        num_to_add = len(reqs_to_add)
-
-        # Sanity check:
-        if self.check_redundant_reqs(reqs_to_add):
-            raise RuntimeError("Redundant requests detected in dLLM requests.")
-
-        if len(self.reqs) + num_to_add > self.max_running_reqs:
-            raise RuntimeError(
-                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
-            )
-
-        self.reqs.extend(reqs_to_add)
-
-    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
-        existing_rids: Set[str] = {r.rid for r in self.reqs}
-        return any(req.rid in existing_rids for req in reqs)
-
-    def init_next_round(self):
-        for req in self.reqs:
-            req.init_next_round_input()
-
-    def non_empty(self) -> bool:
-        return self.dllm_config is not None and len(self.reqs) > 0
-
-    def empty(self) -> bool:
-        return self.dllm_config is None or len(self.reqs) == 0
-
-    def update_chunked_status(self):
-        for req in self.reqs:
-            req.is_chunked += 1
-
-    def filter_finished_reqs(self):
-        self.reqs = [req for req in self.reqs if not req.finished()]
-
-    def __iter__(self):
-        return iter(self.reqs)
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1295,7 +1299,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
-    tree_cache: BasePrefixCache = None
+    tree_cache_hicache: BasePrefixCache = None
+    tree_cache_fusionrag: BasePrefixCache = None
     is_hybrid_swa: bool = False
 
     # Batch configs
@@ -1404,14 +1409,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = -1
+    hicache_consumer_index: list[int] = None
 
     # Diffusion LLM
-    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     @classmethod
     def init_new(
@@ -1419,12 +1424,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        tree_cache: BasePrefixCache,
+        tree_cache_hicache: BasePrefixCache,
+        tree_cache_fusionrag: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1437,7 +1442,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
+            tree_cache_hicache=tree_cache_hicache,
+            tree_cache_fusionrag=tree_cache_fusionrag,
             is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -1450,7 +1456,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
-            dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
         )
 
@@ -1551,7 +1556,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_only_extend = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         recompute_cache_indices = []
         for r in reqs:
-            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx])
+            recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
             r.all_compute_idx.extend(extend_compute_idx)
@@ -1561,13 +1566,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a KV GEN TASK")
             else:
                 print(f"mengyao_debug This is a DECODER TASK")
-            if len(r.prefix_indices) >0:
+            if r.host_hit_length_fusionrag >0:
                 print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / len(r.prefix_indices) * 100:.2f}%\n prefix length={len(r.prefix_indices)}")
+                      f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
+                # torch.set_printoptions(threshold=10000)
+                print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
+                print(f"mengyao_debug recompute_idx_origin={r.recompute_idx_origin}")
+                print(f"mengyao_debug recompute_idx={r.recompute_idx}")
+                # torch.set_printoptions(threshold=1000)
             else:
                 print(f"mengyao_debug compute percentage=100%")
-            # print(f"r.all_compute_idx = {len(r.all_compute_idx)}")
-            # print(f"r.fill_ids = {len(r.fill_ids)}")
+            print(f"r.all_compute_idx = {r.all_compute_idx}")
+            print(f"r.fill_ids = {len(r.fill_ids)}")
+            print(f"r.fill_ids recompute = {[r.fill_ids[i] for i in r.all_compute_idx]}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
             input_ids.append(input_id)
 
@@ -1648,7 +1659,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
             # flag will always True
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                new_cached = pre_len - req.already_computed
+                req.cached_tokens += new_cached
+
+                # Calculate detailed breakdown of cached tokens by source (for HiCache)
+                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
+                # would incorrectly count previously computed tokens as cache hits.
+                if not req._cache_breakdown_computed:
+                    # At this point, prefix_indices has been extended with host data
+                    # via init_load_back in schedule_policy, so:
+                    # - len(prefix_indices) = device_original + host_loaded
+                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
+                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
+                    # - device_portion = len(prefix_indices) - host_hit_length
+                    #
+                    # Storage hits are now tracked via scheduler after prefetch completes.
+                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
+                    host_total = req.host_hit_length
+                    # Clamp storage to host_total to handle edge cases
+                    storage_portion = min(host_total, req.storage_hit_length)
+                    host_portion = host_total - storage_portion
+                    device_portion = max(0, len(req.prefix_indices) - host_total)
+
+                    req.cached_tokens_device = device_portion
+                    req.cached_tokens_host = host_portion
+                    req.cached_tokens_storage = storage_portion
+                    req._cache_breakdown_computed = True
+
                 req.already_computed = seq_len
             req.is_retracted = False
 
@@ -1888,46 +1925,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
 
-    def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
+    def new_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ):
         page_size = self.token_to_kv_pool_allocator.page_size
         requests = (
             self.reqs
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        if page_size == 1:
-            return len(requests)
 
-        if not self.spec_algorithm.is_none():
-            # A loose bound that err towards safety
-            server_args = get_global_server_args()
-            thresh = server_args.speculative_num_draft_tokens + (
-                (server_args.speculative_eagle_topk or 1)
-                * (server_args.speculative_num_steps or 1)
-            )
-            return sum(
-                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
-            )
+        if self.spec_algorithm.is_none():
+            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            return new_pages * page_size
 
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
-        return (
-            sum(1 for req in requests if req.seqlen % page_size == 0)
-            if self.enable_overlap
-            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
-        )
+        server_args = get_global_server_args()
+        len_per_topk = server_args.speculative_num_steps or 1
+        spec_topk = server_args.speculative_eagle_topk or 1
+        spec_tokens = server_args.speculative_num_draft_tokens
 
-    def check_decode_mem(
-        self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
-    ):
-        num_tokens = (
-            self.new_page_count_next_decode(selected_indices)
-            * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
-        )
+        if page_size > 1 and spec_topk > 1:
+            # last partial page and ceil alignment
+            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
+        elif page_size > 1:
+            # only page alignment
+            len_per_topk = ceil_align(len_per_topk, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
 
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+
+        # v2 eagle has over-allocation
+        return num_tokens * (1 + self.is_spec_v2)
+
+    def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        evict_from_tree_cache(self.tree_cache_hicache, num_tokens) ##
+        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -1938,9 +1972,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs
 
     def retract_decode(
-        self,
-        server_args: ServerArgs,
-        buf_multiplier: int = 1,
+        self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1962,9 +1994,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(
-                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
-            )
+            not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
@@ -1978,7 +2008,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            selected_indices=sorted_indices
         ):
             # Retracting loops ends and still not enough memory
             raise ValueError(
@@ -2012,7 +2042,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(self.tree_cache, num_tokens)
+        evict_from_tree_cache(self.tree_cache_hicache, num_tokens)
 
         req.reset_for_retract()
 
@@ -2359,11 +2389,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
         )
 
     def maybe_evict_swa(self):
-        if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+        if self.tree_cache_hicache.supports_swa():
+            sliding_window_size = self.tree_cache_hicache.sliding_window_size
+            server_args = get_global_server_args()
+
+            if (
+                self.forward_mode.is_decode()
+                and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache_hicache.is_chunk_cache()
+            ):
+                return
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2371,14 +2411,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every window_size tokens to reduce the overhead.
                     if req.decode_batch_idx % sliding_window_size == 1:
                         self._evict_swa(req, req.seqlen - 1)
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and self.tree_cache_hicache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            server_args = get_global_server_args()
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
@@ -2389,12 +2428,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
-        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
+        assert self.tree_cache_hicache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = self.tree_cache_hicache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
         assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
+            req.cache_protected_len % self.tree_cache_hicache.page_size == 0
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
@@ -2402,10 +2441,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.swa_evicted_seqlen, pre_len - sliding_window_size
         )
 
-        if self.tree_cache.page_size > 1:
+        if self.tree_cache_hicache.page_size > 1:
             new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
+                new_swa_evicted_seqlen // self.tree_cache_hicache.page_size
+            ) * self.tree_cache_hicache.page_size
 
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[
@@ -2413,15 +2452,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid_swa:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def __str__(self):
         return (
@@ -2497,7 +2527,7 @@ class ModelWorkerBatch:
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = -1
+    hicache_consumer_index: list[int] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

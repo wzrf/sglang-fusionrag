@@ -31,11 +31,15 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
-
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -92,13 +96,15 @@ class SchedulePolicy:
     def __init__(
         self,
         policy: str,
-        tree_cache: BasePrefixCache,
+        tree_cache_hicache: BasePrefixCache,
+        tree_cache_fusionrag: BasePrefixCache,
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
     ):
-        self.policy = self._validate_and_adjust_policy(policy, tree_cache)
-        self.tree_cache = tree_cache
+        self.policy = self._validate_and_adjust_policy(policy, tree_cache_hicache)
+        self.tree_cache_hicache = tree_cache_hicache
+        self.tree_cache_fusionrag = tree_cache_fusionrag
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
@@ -190,7 +196,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
+            match_result = self.tree_cache.match_prefix( ## mengyao_debug this shouldn't happen.
                 MatchPrefixParams(
                     key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                 )
@@ -229,8 +235,10 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
-                        torch.empty(len(prefix_ids), dtype=torch.bool),
+                        InsertParams(
+                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                        )
                     )
         return temporary_deprioritized
 
@@ -349,9 +357,9 @@ class SchedulePolicy:
         last_node_to_reqs: Dict[TreeNode, List[Req]],
         q: List,
     ) -> None:
-        childs = [child for child in cur_node.children.values()]
-        childs.sort(key=lambda x: -node_to_priority[x])
-        for child in childs:
+        children = [child for child in cur_node.children.values()]
+        children.sort(key=lambda x: -node_to_priority[x])
+        for child in children:
             SchedulePolicy._get_dfs_priority(
                 child, node_to_priority, last_node_to_reqs, q
             )
@@ -368,7 +376,8 @@ class PrefillAdder:
     def __init__(
         self,
         page_size: int,
-        tree_cache: BasePrefixCache,
+        tree_cache_hicache: BasePrefixCache,
+        tree_cache_fusionrag: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
@@ -381,7 +390,8 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
     ):
         self.page_size = page_size
-        self.tree_cache = tree_cache
+        self.tree_cache_hicache = tree_cache_hicache
+        self.tree_cache_fusionrag = tree_cache_fusionrag
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
@@ -417,7 +427,7 @@ class PrefillAdder:
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
-        self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        self.is_hybrid_ssm_cache = self.tree_cache_hicache.supports_mamba()
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -431,7 +441,6 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
-        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=dllm_config)
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -447,19 +456,19 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
+                + self.tree_cache_hicache.full_evictable_size(),
                 self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
+                + self.tree_cache_hicache.swa_evictable_size(),
             )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache_hicache.full_evictable_size()
             )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self.tree_cache_hicache.evictable_size()
             )
         return available_and_evictable - self.rem_total_token_offset
 
@@ -468,19 +477,19 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
+                + self.tree_cache_hicache.full_evictable_size(),
                 self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
+                + self.tree_cache_hicache.swa_evictable_size(),
             )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache_hicache.full_evictable_size()
             )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self.tree_cache_hicache.evictable_size()
             )
 
         return available_and_evictable - self.cur_rem_token_offset
@@ -547,16 +556,43 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
         self.can_run_list.append(req)
-        self.dllm_staging_reqs.add_reqs(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
         if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+            swa_uuid_for_lock = self.tree_cache_hicache.inc_lock_ref(req.last_node)
             req.swa_uuid_for_lock = swa_uuid_for_lock
         else:
-            self.tree_cache.inc_lock_ref(req.last_node)
+            self.tree_cache_hicache.inc_lock_ref(req.last_node)
+
+    def add_dllm_staging_req(self, req: Req):
+        assert self.dllm_config is not None
+        _rem_tokens = self._get_dllm_remain_tokens()
+
+        if _rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+
+        # Truncate input length to available tokens and update request metadata
+        truncated = req.extend_input_len > _rem_tokens
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        self.can_run_list.append(req)
+
+        # Update budget: reserve max_new_tokens only if not truncated
+        max_new_tokens = (
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if not truncated
+            else 0
+        )
+        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+
+        # Return based on remaining token availability
+        return (
+            AddReqResult.NO_TOKEN
+            if self._get_dllm_remain_tokens() <= 0
+            else AddReqResult.CONTINUE
+        )
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
@@ -588,16 +624,16 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         try:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+            if self.tree_cache_hicache.supports_swa() and self.tree_cache_hicache.is_tree_cache():
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
             else:
-                self.tree_cache.inc_lock_ref(last_node)
+                self.tree_cache_hicache.inc_lock_ref(last_node)
             yield None
         finally:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+            if self.tree_cache_hicache.supports_swa() and self.tree_cache_hicache.is_tree_cache():
+                self.tree_cache_hicache.dec_lock_ref(last_node, swa_uuid_for_lock)
             else:
-                self.tree_cache.dec_lock_ref(last_node)
+                self.tree_cache_hicache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
         # Early exit if no enough tokens for the input tokens
@@ -698,7 +734,7 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache_hicache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
@@ -727,25 +763,70 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
-                if not req.use_chunk_node:
-                    new_indices, req.last_node = self.tree_cache.init_load_back(
-                        req.last_host_node, req.host_hit_length
-                    )
-                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                    prefix_len = len(req.prefix_indices)
-                    req.cache_protected_len = prefix_len
+                if req.use_mix_prefix_cache:
+                    ## this is a kv gen task, didn't use prefix cache.
+                    if req.last_host_node is None:
+                        new_indices, values_list = self.tree_cache_fusionrag.init_load_back_chunk(req.hit_chunk_nodes,
+                                                                                                  self.tree_cache_hicache, len(req.prefix_cache_ids))
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                        if len(req.prefix_indices) >= len(req.fill_ids):
+                            req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
+                        req.hit_chunk_values = values_list
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+                        req.cache_protected_len = prefix_len
+                    else:
+                        new_indices_hicache, req.last_node = self.tree_cache_hicache.init_load_back(
+                            req.last_host_node, req.host_hit_length_hicache
+                        )
+
+                        prefix_indices_hicache = torch.cat([req.prefix_indices, new_indices_hicache])
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices_hicache])
+                        ## 把fusionrag cache和 prefix到fusionrag开始的这个gap 都视作decode出来的内容，不然这显存部分释放不掉
+                        req.cache_protected_len = len(prefix_indices_hicache)
+
+                        if req.hit_chunk_nodes is not None and len(req.hit_chunk_nodes) > 0:
+                            new_indices_fusionrag, values_list = self.tree_cache_fusionrag.init_load_back_chunk(
+                                req.hit_chunk_nodes, self.tree_cache_hicache, len(req.prefix_cache_ids))
+                            ## 前缀不一定都匹配上了。如果没有匹配上的话，hicache和fusionragcache中间的部分要重算
+                            ## 这部分算作prefix cache（要重算的prefix cache），但是不算在cache_protected_len里面
+                            if len(prefix_indices_hicache) < len(req.prefix_cache_ids):
+                                length_diff = len(req.prefix_cache_ids) - len(prefix_indices_hicache)
+                                diff_cache_loc = alloc_token_slots(self.tree_cache_hicache, length_diff)
+                                req.prefix_indices = torch.cat([req.prefix_indices, diff_cache_loc])
+                                print(f"[fusionrag gap] length_diff={length_diff}, diff_cache_loc={diff_cache_loc},"
+                                      f"prefix_indices_hicache={len(prefix_indices_hicache)}, prefix_cache_ids={len(req.prefix_cache_ids)}")
+                                print(f"matched prefix diff={req.prefix_cache_ids[-length_diff-20:]}")
+                                req.recompute_idx[:0] =range(len(prefix_indices_hicache), len(req.prefix_cache_ids))
+                                req.recompute_idx = sorted(set(req.recompute_idx))
+                            req.hit_chunk_values = values_list
+                            req.prefix_indices = torch.cat([req.prefix_indices, new_indices_fusionrag])
+
+                        if len(req.prefix_indices) >= len(req.fill_ids):
+                            req.prefix_indices = req.prefix_indices[:len(req.fill_ids)-1]
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+
+
                 else:
-                    new_indices, values_list = self.tree_cache.init_load_back_chunk(
-                        req.hit_chunk_nodes
-                    )
-                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                    if len(req.prefix_indices) >= len(req.fill_ids):
-                        req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
-                    req.hit_chunk_values = values_list
-                    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                    prefix_len = len(req.prefix_indices)
-                    req.cache_protected_len = prefix_len
+                    if not req.use_chunk_node:
+                        new_indices, req.last_node = self.tree_cache_hicache.init_load_back(
+                            req.last_host_node, req.host_hit_length
+                        )
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+                        req.cache_protected_len = prefix_len
+                    else:
+                        new_indices, values_list = self.tree_cache_fusionrag.init_load_back_chunk(req.hit_chunk_nodes,
+                                                                                                  None, len(req.prefix_cache_ids))
+                        req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                        if len(req.prefix_indices) >= len(req.fill_ids):
+                            req.prefix_indices = new_indices[:len(req.fill_ids)-1] ##mengyao_debug hardcode left one for prefill
+                        req.hit_chunk_values = values_list
+                        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                        prefix_len = len(req.prefix_indices)
+                        req.cache_protected_len = prefix_len
 
             ### make sure it doesn't overflow
             req.recompute_idx = [idx for idx in req.recompute_idx if idx < len(req.prefix_indices)]
@@ -823,8 +904,16 @@ class PrefillAdder:
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
+        # NOTE: A request finishes in two phases:
+        #   1) check_finished + release_kv_cache  (in process_batch_result)
+        #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
+        # Preemption runs between these two phases (inside get_new_batch_prefill),
+        # so running_batch may still contain requests whose KV cache is already freed.
+        # We must skip them here to avoid a double-free on release_req.
         valid_running_reqs = (
-            r for r in self.running_batch.reqs if r not in self.preempt_list
+            r
+            for r in self.running_batch.reqs
+            if r not in self.preempt_list and not r.finished()
         )
 
         sorted_valid_running_reqs = sorted(
