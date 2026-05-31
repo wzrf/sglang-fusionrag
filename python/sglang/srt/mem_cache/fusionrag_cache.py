@@ -729,7 +729,7 @@ class FusionragCache(RadixCache):
         ""
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(self, req: Req, tp_rank=0, is_insert: bool = True) -> None:
         if req.is_kv_gen and req.save_preprocess_cache:
             print(f"save preprocess cache") ## for debug
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
@@ -771,8 +771,12 @@ class FusionragCache(RadixCache):
             prompt_ids = req.origin_input_ids
             prefix_prompt_ids = req.kv_gen_prefix_len
             prompt_ids_without_prefix = prompt_ids[prefix_prompt_ids:]
-            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
-                                      prompt_ids_without_prefix) ## 不存储prefix部分
+            if tp_rank == 0:
+                print(f"tp_rank={tp_rank}, saving to disk.")
+                self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
+                                          prompt_ids_without_prefix) ## 不存储prefix部分
+            else:
+                print(f"tp_rank={tp_rank}, NOT saving to disk.")
 
             ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
             kv_committed_len = req.pop_committed_kv_cache()
@@ -795,6 +799,7 @@ class FusionragCache(RadixCache):
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
+        tp_rank = get_attention_tp_rank()
         kv_cache = []
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')

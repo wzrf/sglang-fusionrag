@@ -481,7 +481,7 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                 else:
                     # release_kv_cache(req, self.tree_cache_fusionrag)
-                    self.tree_cache_fusionrag.cache_finished_req(req)
+                    self.tree_cache_fusionrag.cache_finished_req(req, tp_rank=self.tp_rank)
                     release_kv_cache(req, self.tree_cache_hicache)
 
                 req.time_stats.set_completion_time()
