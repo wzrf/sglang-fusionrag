@@ -21,7 +21,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors, ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -197,7 +197,26 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        save_kv_cache = True
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            save_kv_cache = False
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer=self.attn,
+                loc=forward_batch.out_cache_loc,
+                cache_k=k,
+                cache_v=v,
+            )
+            kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+            k_ = k_[kv_indices]
+            v_ = v_[kv_indices]
+            k = k_.flatten(start_dim=-2).contiguous()
+            v = v_.flatten(start_dim=-2).contiguous()
+            if self.attn.layer_id == 0:
+                print("EXTEND")
+
+
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -403,6 +422,7 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        self.fix_rope_test(forward_batch)
         hidden_states = self.model(
             input_ids,
             positions,
@@ -582,6 +602,75 @@ class Qwen3ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+    def fix_rope_test(
+        self,
+        forward_batch
+    ):
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        for req in forward_batch.reqs:
+            if req.is_kv_gen:
+                continue
+            if req.hit_chunk_values is not None:
+                for layer_id, layer in enumerate(self.model.layers):
+                    for hit_chunk_node in req.hit_chunk_values:
+                        device_indices = hit_chunk_node.value
+                        k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                        k = k_[device_indices]
+                        v = v_[device_indices]
+
+                        k_rope = correct_rope_rotation(k,
+                                                       layer.self_attn.rotary_emb.cos_sin_cache,
+                                                       wrong_positions=hit_chunk_node.original_position,
+                                                       correct_positions=hit_chunk_node.current_position)
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer=layer.self_attn.attn,
+                            loc=device_indices,
+                            cache_k=k_rope,
+                            cache_v=v,
+                        )
+
+def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positions):
+    """
+    修正错误的RoPE旋转
+    k_wrong: 已经用wrong_positions旋转过的张量 [seq_len, num_heads, head_dim]
+    rotary_cache: [max_position, head_dim]，前一半是cos，后一半是sin
+    wrong_positions: 之前错误使用的位置
+    correct_positions: 正确的位置
+    """
+    seq_len, num_heads_k, head_dim = k_wrong.shape
+    half_dim = head_dim // 2
+
+    # 1. 获取错误位置的cos/sin
+    wrong_cache = rotary_cache[wrong_positions]
+    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1)
+    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1)
+
+    # 2. 获取正确位置的cos/sin
+    correct_cache = rotary_cache[correct_positions]
+    cos_correct = correct_cache[:, :half_dim].unsqueeze(1)
+    sin_correct = correct_cache[:, half_dim:].unsqueeze(1)
+
+    # 3. 计算旋转差值的cos/sin
+    cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong
+    sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong
+
+    ##fixme:  这个对应的是neox
+    k_even, k_odd = torch.chunk(k_wrong, 2, dim=-1)
+
+    # 6. 应用修正旋转
+    k_correct_even = k_even * cos_delta - k_odd * sin_delta
+    k_correct_odd = k_even * sin_delta + k_odd * cos_delta
+
+    # 7. 重新组合
+    k_correct = torch.cat((k_correct_even, k_correct_odd), dim=-1)
+
+    return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype).contiguous()
+
 
 
 EntryClass = Qwen3ForCausalLM

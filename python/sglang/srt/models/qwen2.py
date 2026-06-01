@@ -210,6 +210,8 @@ class Qwen2Attention(nn.Module):
             v_ = v_[kv_indices]
             k = k_.flatten(start_dim=-2).contiguous()
             v = v_.flatten(start_dim=-2).contiguous()
+            if self.attn.layer_id == 0:
+                print("EXTEND")
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
