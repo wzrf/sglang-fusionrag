@@ -705,13 +705,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Tokenize
         input_embeds = None
         input_text = obj.text
-        # global TOKENIZE_ID
-        # print("="*100)
-        # print(f"[_tokenize_one_request] TOKENIZE_ID={TOKENIZE_ID}\n input_text={input_text}")
-        # with open(f"/mnt/data3/xmy/fusionrag_debug/text/input_text_{TOKENIZE_ID}.txt", "a") as f:
-        #     f.write(input_text)
-        # print("="*100)
-        # TOKENIZE_ID += 1
         token_type_ids = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request

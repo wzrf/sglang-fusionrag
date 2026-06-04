@@ -1535,6 +1535,13 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if recv_req.fusionrag_params is not None and recv_req.fusionrag_params.get("save_cache", False) is True:
+                from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+                recv_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                recv_req.bootstrap_room = 0
+                req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                req.bootstrap_room = 0
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (

@@ -953,7 +953,7 @@ class Req(ReqDllmMixin):
                 print(f"req doesn't need to be run.")
                 self.no_need_to_run = True
         else:
-            if len(self.prefix_cache_ids) > 0:
+            if len(self.prefix_cache_ids) >= 0:
                 print(f"[hiradix cache] req prefix_cache_ids length = {len(self.prefix_cache_ids)}")
                 token_ids = self.fill_ids[:len(self.prefix_cache_ids)]
             match_result_prefix = tree_cache_hicache.match_prefix(

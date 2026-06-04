@@ -299,7 +299,7 @@ class PrefillBootstrapQueue:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 if self.scheduler.enable_hicache_storage:
                     # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
+                    self.scheduler.tree_cache_hicache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here
@@ -343,13 +343,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.process_prefill_chunk()
 
-        batch, _ = self.get_new_batch_prefill()
+        batch, no_run_list = self.get_new_batch_prefill()
         batch = self.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
-        return batch
+        return batch, no_run_list
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -364,7 +364,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
+            batch, no_run_list = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             # Launch the current batch
@@ -373,6 +373,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
+
+            self.process_batch_result_no_run(no_run_list)
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -466,7 +468,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                self.tree_cache_hicache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -572,7 +574,8 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self.tree_cache_fusionrag.cache_finished_req(req, tp_rank=self.tp_rank)
+                release_kv_cache(req, self.tree_cache_hicache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -587,7 +590,8 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self.tree_cache_fusionrag.cache_finished_req(req, tp_rank=self.tp_rank)
+                release_kv_cache(req, self.tree_cache_hicache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -638,7 +642,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            self.tree_cache_hicache.cache_unfinished_req(self.chunked_req, chunked=True)
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
