@@ -307,13 +307,14 @@ class PrefillBootstrapQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert req.metadata_buffer_index is not None
+            if not req.is_kv_gen:
+                req.metadata_buffer_index = (
+                    self.req_to_metadata_buffer_idx_allocator.alloc()
+                )
+                assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+                num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+                req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
