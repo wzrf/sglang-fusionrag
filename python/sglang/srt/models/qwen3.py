@@ -1,4 +1,5 @@
 # Adapted from qwen2.py
+import copy
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -149,7 +150,23 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        # q_ = copy.deepcopy(q)
+        # k_ = copy.deepcopy(k)
+        # positions_0 = torch.zeros(len(positions), dtype=torch.int32)
+        #
+        # num_tokens = len(positions)
+        # q_ = q_.view(num_tokens, -1, self.head_dim)
+        # k_ = k_.view(num_tokens, -1, self.head_dim)
+        # q_ = correct_rope_rotation(q_, self.rotary_emb.cos_sin_cache, positions_0, positions)
+        # k_ = correct_rope_rotation(k_, self.rotary_emb.cos_sin_cache, positions_0, positions)
+        # q_ = q_.view(num_tokens, -1)
+        # k_ = k_.view(num_tokens, -1)
+
         q, k = self.rotary_emb(positions, q, k)
+        #
+        # diff = compare_relative_difference_torch(k, k_)
+        # print(diff)
+
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -197,6 +214,10 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
+        def has_duplicates(tensor):
+            # 展平后比较元素总数与唯一元素个数
+            return tensor.numel() != torch.unique(tensor).numel()
+
         save_kv_cache = True
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             save_kv_cache = False
@@ -213,7 +234,9 @@ class Qwen3Attention(nn.Module):
             k = k_.flatten(start_dim=-2).contiguous()
             v = v_.flatten(start_dim=-2).contiguous()
             if self.attn.layer_id == 0:
-                print("EXTEND")
+                print(f"EXTEND k size = {k.size()}, q.size() = {q.size()}")
+                if has_duplicates(kv_indices):
+                    print(f"mengyao_debug kv_indices HAS DUPLICATES, kv_indices={kv_indices}")
 
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
@@ -618,21 +641,22 @@ class Qwen3ForCausalLM(nn.Module):
             if req.hit_chunk_values is not None:
                 for layer_id, layer in enumerate(self.model.layers):
                     for hit_chunk_node in req.hit_chunk_values:
-                        device_indices = hit_chunk_node.value
-                        k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-                        k = k_[device_indices]
-                        v = v_[device_indices]
-
-                        k_rope = correct_rope_rotation(k,
-                                                       layer.self_attn.rotary_emb.cos_sin_cache,
-                                                       wrong_positions=hit_chunk_node.original_position,
-                                                       correct_positions=hit_chunk_node.current_position)
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer=layer.self_attn.attn,
-                            loc=device_indices,
-                            cache_k=k_rope,
-                            cache_v=v,
-                        )
+                        ## fixme: mengyao_debug 这里可能有bug
+                        if hit_chunk_node.original_position[0] > hit_chunk_node.current_position[0]:
+                            device_indices = hit_chunk_node.value
+                            k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                            k = k_[device_indices]
+                            v = v_[device_indices]
+                            k_rope = correct_rope_rotation(k,
+                                                           layer.self_attn.rotary_emb.cos_sin_cache,
+                                                           wrong_positions=hit_chunk_node.original_position,
+                                                           correct_positions=hit_chunk_node.current_position)
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer=layer.self_attn.attn,
+                                loc=device_indices,
+                                cache_k=k_rope,
+                                cache_v=v,
+                            )
 
 def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positions):
     """
@@ -647,8 +671,8 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 
     # 1. 获取错误位置的cos/sin
     wrong_cache = rotary_cache[wrong_positions]
-    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1)
-    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1)
+    cos_wrong = wrong_cache[:, :half_dim].unsqueeze(1).to(k_wrong.dtype)
+    sin_wrong = wrong_cache[:, half_dim:].unsqueeze(1).to(k_wrong.dtype)
 
     # 2. 获取正确位置的cos/sin
     correct_cache = rotary_cache[correct_positions]
@@ -658,6 +682,9 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     # 3. 计算旋转差值的cos/sin
     cos_delta = cos_correct * cos_wrong + sin_correct * sin_wrong
     sin_delta = sin_correct * cos_wrong - cos_correct * sin_wrong
+
+    cos_delta = cos_delta.to(k_wrong.dtype)
+    sin_delta = sin_delta.to(k_wrong.dtype)
 
     ##fixme:  这个对应的是neox
     k_even, k_odd = torch.chunk(k_wrong, 2, dim=-1)
@@ -671,6 +698,37 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype).contiguous()
 
+import torch
+import numpy as np
 
+def compare_relative_difference_torch(a, b, mode='b', eps=1e-8):
+    a = a.detach().float()
+    b = b.detach().float()
+    diff_abs = torch.abs(a - b)
+
+    if mode == 'b':
+        denom = torch.abs(b) + eps
+    elif mode == 'max':
+        denom = torch.max(torch.abs(a), torch.abs(b)) + eps
+    elif mode == 'mean':
+        denom = (torch.abs(a) + torch.abs(b)) / 2 + eps
+    else:
+        raise ValueError("mode must be 'b', 'max', or 'mean'")
+
+    rel_diff = diff_abs / denom
+
+    max_val = torch.max(rel_diff)
+    idx_flat = torch.argmax(rel_diff)
+    position = np.unravel_index(idx_flat.cpu().numpy(), a.shape)
+
+    mean_val = torch.mean(rel_diff)
+
+    return {
+        'max_rel_diff': max_val.item(),
+        'max_position': position,
+        'max_value_a': a.flatten()[idx_flat].item(),
+        'max_value_b': b.flatten()[idx_flat].item(),
+        'mean_rel_diff': mean_val.item()
+    }
 
 EntryClass = Qwen3ForCausalLM

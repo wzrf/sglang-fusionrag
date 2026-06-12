@@ -294,7 +294,7 @@ class FusionragCache(RadixCache):
             try:
                 ##fixme mengyao_debug: this is the qwen cache
                 if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[1]:
-                    print(f"shape mismatch.")
+                    print(f"shape mismatch. chunk_tensor shape = {chunk_tensor.shape}, layer_num = {self.cache_controller.mem_pool_host.layer_num}")
                     continue
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
                 if host_indices is None:
