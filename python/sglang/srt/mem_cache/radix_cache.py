@@ -460,6 +460,30 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
+        ##fixme: mengyao_debug there is bug when release kv cache.
+        """
+        File "/mnt/data/xmy/sglang/python/sglang/srt/managers/scheduler.py", line 2201, in _get_new_batch_prefill_raw
+    new_batch.prepare_for_extend()
+  File "/mnt/data/xmy/sglang/python/sglang/srt/managers/schedule_batch.py", line 1630, in prepare_for_extend
+    out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/common.py", line 367, in alloc_for_extend
+    out_cache_loc_extend = alloc_token_slots(batch.tree_cache_hicache, len(input_ids_only_extend[i]))
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/common.py", line 208, in alloc_token_slots
+    evict_from_tree_cache(tree_cache, num_tokens)
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/common.py", line 253, in evict_from_tree_cache
+    tree_cache.evict(EvictParams(num_tokens=num_tokens))
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/hiradix_cache.py", line 798, in evict
+    num_evicted += self.write_backup(x, write_back=True)
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/hiradix_cache.py", line 621, in write_backup
+    self.evict_host(len(node.value))
+  File "/mnt/data/xmy/sglang/python/sglang/srt/mem_cache/hiradix_cache.py", line 867, in evict_host
+    assert v == x, f"parent does not have child key, {key}"
+AssertionError: parent does not have child key, 7801
+        """
+
+        ## 目前这有bug，测试rag场景的时候需要把is_insert关掉
+        is_insert = False
+
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
