@@ -277,6 +277,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    rope_fixed = False
 
     # For extend
     extend_num_tokens: Optional[int] = None

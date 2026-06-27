@@ -196,6 +196,9 @@ class Qwen2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k) ## [len, 512]
         save_kv_cache = True
+        def has_duplicates(tensor):
+            # 展平后比较元素总数与唯一元素个数
+            return tensor.numel() != torch.unique(tensor).numel()
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             save_kv_cache = False
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -205,6 +208,11 @@ class Qwen2Attention(nn.Module):
                 cache_v=v,
             )
             kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            if self.attn.layer_id == 0:
+                if has_duplicates(kv_indices):
+                    print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, ")
+                if has_duplicates(forward_batch.out_cache_loc):
+                    print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
             k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
             k_ = k_[kv_indices]
             v_ = v_[kv_indices]
@@ -515,6 +523,8 @@ class Qwen2Model(nn.Module):
             return
         if forward_batch is None or forward_batch.reqs is None:
             return
+        if forward_batch.rope_fixed:
+            return
         for req in forward_batch.reqs:
             if req.is_kv_gen:
                 continue
@@ -536,6 +546,7 @@ class Qwen2Model(nn.Module):
                             cache_k=k_rope,
                             cache_v=v,
                         )
+        forward_batch.rope_fixed = True
 
 
 

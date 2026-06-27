@@ -635,28 +635,31 @@ class Qwen3ForCausalLM(nn.Module):
             return
         if forward_batch is None or forward_batch.reqs is None:
             return
+        if forward_batch.rope_fixed:
+            return
         for req in forward_batch.reqs:
             if req.is_kv_gen:
                 continue
             if req.hit_chunk_values is not None:
                 for layer_id, layer in enumerate(self.model.layers):
                     for hit_chunk_node in req.hit_chunk_values:
-                        ## fixme: mengyao_debug 这里可能有bug
-                        if hit_chunk_node.original_position[0] > hit_chunk_node.current_position[0]:
-                            device_indices = hit_chunk_node.value
-                            k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-                            k = k_[device_indices]
-                            v = v_[device_indices]
-                            k_rope = correct_rope_rotation(k,
-                                                           layer.self_attn.rotary_emb.cos_sin_cache,
-                                                           wrong_positions=hit_chunk_node.original_position,
-                                                           correct_positions=hit_chunk_node.current_position)
-                            forward_batch.token_to_kv_pool.set_kv_buffer(
-                                layer=layer.self_attn.attn,
-                                loc=device_indices,
-                                cache_k=k_rope,
-                                cache_v=v,
-                            )
+                        # ## fixme: mengyao_debug 这里可能有bug
+                        # if hit_chunk_node.original_position[0] > hit_chunk_node.current_position[0]:
+                        device_indices = hit_chunk_node.value
+                        k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                        k = k_[device_indices]
+                        v = v_[device_indices]
+                        k_rope = correct_rope_rotation(k,
+                                                       layer.self_attn.rotary_emb.cos_sin_cache,
+                                                       wrong_positions=hit_chunk_node.original_position,
+                                                       correct_positions=hit_chunk_node.current_position)
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer=layer.self_attn.attn,
+                            loc=device_indices,
+                            cache_k=k_rope,
+                            cache_v=v,
+                        )
+        forward_batch.rope_fixed = True
 
 def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positions):
     """
