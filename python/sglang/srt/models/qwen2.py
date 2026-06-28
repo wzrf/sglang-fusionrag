@@ -186,6 +186,60 @@ class Qwen2Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def forward_normal_core_fusionrag(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        scaling: float
+    ):
+        seq_len_q = q.shape[0]
+        seq_len_k = k.shape[0]
+        num_heads = self.num_heads
+        num_kv_heads = self.total_num_kv_heads
+        head_dim = self.head_dim
+
+        # 1. 重塑为多头形式
+        q = q.view(seq_len_q, num_heads, head_dim)  # (seq_len_q, 28, 128)
+        k = k.view(seq_len_k, num_kv_heads, head_dim)  # (seq_len_k, 4, 128)
+        v = v.view(seq_len_k, num_kv_heads, head_dim)  # (seq_len_k, 4, 128)
+
+        # 2. 分组查询注意力（GQA）：将 kv 头复制到与 q 头相同的数量
+        repeat_factor = num_heads // num_kv_heads  # 28 // 4 = 7
+        k = k.repeat_interleave(repeat_factor, dim=1)  # (seq_len_k, 28, 128)
+        v = v.repeat_interleave(repeat_factor, dim=1)  # (seq_len_k, 28, 128)
+
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        # 3. 计算注意力分数
+        # scores: (seq_len_q, 28, seq_len_k)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scaling
+        # print(f"q shape={q.shape}, k shape={k.shape}, v shape={v.shape}")
+
+        # 4. 构建掩码
+        mask = torch.zeros(seq_len_q, seq_len_k, dtype=torch.bool, device=scores.device)
+        if forward_batch.reqs[0].all_compute_idx is not None:
+            for i, q_idx in enumerate(forward_batch.reqs[0].all_compute_idx):
+                mask[i, q_idx + 1:] = True  # True表示要mask掉的位置
+        else:
+            for i in range(seq_len_q):
+                mask[i, i + 1:] = True  # True表示要mask掉的位置
+
+        scores = scores.masked_fill(mask, float('-inf'))
+
+        # 5. 计算注意力权重和输出
+        attn = torch.softmax(scores, dim=-1)
+        v = v.transpose(0, 1)
+        # print(f"v shape={v.shape}, attn shape={attn.shape}")
+        o = torch.matmul(attn, v)
+        # print(f"o shape = {o.shape}")
+        o = o.transpose(0, 1).contiguous()
+        o = o.view(o.shape[0], -1)
+
+        # print(f"o.shape={o.shape}")
+        return o
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -196,6 +250,10 @@ class Qwen2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k) ## [len, 512]
         save_kv_cache = True
+        def has_duplicates(tensor):
+            # 展平后比较元素总数与唯一元素个数
+            return tensor.numel() != torch.unique(tensor).numel()
+
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             save_kv_cache = False
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -205,13 +263,26 @@ class Qwen2Attention(nn.Module):
                 cache_v=v,
             )
             kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            if self.attn.layer_id == 0:
+                torch.set_printoptions(threshold=10000)
+                if has_duplicates(kv_indices):
+                    print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, ")
+                if has_duplicates(forward_batch.out_cache_loc):
+                    print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
+                print(kv_indices)
+                print(forward_batch.out_cache_loc)
+                torch.set_printoptions(threshold=1000)
             k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
             k_ = k_[kv_indices]
             v_ = v_[kv_indices]
             k = k_.flatten(start_dim=-2).contiguous()
             v = v_.flatten(start_dim=-2).contiguous()
 
-        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+            attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.scaling)
+            # attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+
+        else:
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -272,6 +343,7 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.save_idx = 0
 
     def forward(
         self,
@@ -291,6 +363,10 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        # save_path = f"/mnt/data/xmy/mengyao_debug/sglang/qwen2/"
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     torch.save(hidden_states, f"{save_path}/{self.save_idx}_{self.self_attn.attn.layer_id}_hidden_states.pt")
+        #     self.save_idx += 1
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -366,8 +442,8 @@ class Qwen2Model(nn.Module):
 
         tp_size_ = get_tensor_model_parallel_world_size()
         cache_path_root = "/mnt/data3"
-        # if not os.path.exists(cache_path_root):
-        #     cache_path_root = "/mnt/data"
+        if not os.path.exists(cache_path_root):
+            cache_path_root = "/mnt/data"
         model_name = getattr(config, "model_type", "qwen2")
         model_name = model_name.replace("/", "_")
         self.cache_path = f"/mnt/data3/shm/fusionrag/{model_name}/raw_kv_cache"
@@ -403,7 +479,7 @@ class Qwen2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
-        self.fix_rope_test(forward_batch)
+        # self.fix_rope_test(forward_batch)
         # self.save_for_debug(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:

@@ -91,7 +91,7 @@ class MultiPlatformOp(nn.Module):
 
     def dispatch_forward(self):
         if _is_cuda:
-            return self.forward_cuda
+            return self.forward_native
         elif _is_hip:
             return self.forward_hip
         elif _is_cpu and _is_cpu_amx_available:

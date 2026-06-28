@@ -229,15 +229,15 @@ class FusionragCache(RadixCache):
         self.eviction_policy = "lru" ## mengyao_debug
         self.eviction_strategy: EvictionStrategy = LRUStrategy()
 
-        cache_path_root = "/mnt/data3"
+        cache_path_root = "/mnt/data"
         served_model_name = server_args.served_model_name
         # if not os.path.exists(cache_path_root):
         #     cache_path_root = "/mnt/data"
-        self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+        self.cache_path = f"/mnt/data/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
+        self.preprocess_cache_path = f"/mnt/data/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"/mnt/data3/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"/mnt/data/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
+            self.preprocess_cache_path = f"/mnt/data/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
