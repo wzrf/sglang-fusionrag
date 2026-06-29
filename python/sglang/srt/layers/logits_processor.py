@@ -482,18 +482,26 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
 
-            for idx, (extend_logprob_start_len, extend_len) in enumerate(
-                zip(
-                    logits_metadata.extend_logprob_start_lens_cpu,
-                    logits_metadata.extend_seq_lens_cpu,
-                )
-            ):
+            # for idx, (extend_logprob_start_len, extend_len) in enumerate(
+            #     zip(
+            #         logits_metadata.extend_logprob_start_lens_cpu,
+            #         logits_metadata.extend_seq_lens_cpu,
+            #     )
+            # ):
+            extend_all_compute_lens_cpu = logits_metadata.extend_all_compute_lens.tolist()
+            for idx, extend_all_compute_len in enumerate(extend_all_compute_lens_cpu):
                 # It can happen in chunked prefill. We still need to sample 1 token,
                 # But we don't want to include it in input logprob.
-                if extend_len == extend_logprob_start_len:
-                    start_len = extend_logprob_start_len - 1
-                else:
-                    start_len = extend_logprob_start_len
+                # if extend_len == extend_logprob_start_len:
+                #     start_len = extend_logprob_start_len - 1
+                # else:
+                #     start_len = extend_logprob_start_len
+
+                extend_len = extend_all_compute_len
+                start_len = extend_all_compute_len - 1
+                extend_logprob_start_len = start_len
+
+                print(f"[logits_processor] extend_len={extend_len} start_len={start_len}, hidden_states={hidden_states.shape}")
 
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
@@ -634,10 +642,13 @@ class LogitsProcessor(nn.Module):
         else:
             input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
-        input_token_logprobs = input_logprobs[
-            torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-            logits_metadata.extend_input_logprob_token_ids_gpu,
-        ]
+        try:
+            input_token_logprobs = input_logprobs[
+                torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
+                logits_metadata.extend_input_logprob_token_ids_gpu,
+            ]
+        except Exception as e:
+            print(e)
 
         return InputLogprobsResult(
             input_token_logprobs=input_token_logprobs,
