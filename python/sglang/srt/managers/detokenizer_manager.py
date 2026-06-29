@@ -322,6 +322,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             # Incrementally send text.
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
+            print(f"incremental_output={incremental_output}")
             output_strs.append(incremental_output)
 
         return output_strs

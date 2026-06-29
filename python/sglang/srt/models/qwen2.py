@@ -264,22 +264,22 @@ class Qwen2Attention(nn.Module):
             )
             kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
             if self.attn.layer_id == 0:
-                torch.set_printoptions(threshold=10000)
                 if has_duplicates(kv_indices):
                     print(f"mengyao_debug kv_indice HAS DUPLICATES, kv_indices={kv_indices}, ")
                 if has_duplicates(forward_batch.out_cache_loc):
                     print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
-                print(kv_indices)
-                print(forward_batch.out_cache_loc)
-                torch.set_printoptions(threshold=1000)
+                print(f"kv_indices={kv_indices}")
+                print(f"forward_batch.out_cache_loc={forward_batch.out_cache_loc}")
             k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
             k_ = k_[kv_indices]
             v_ = v_[kv_indices]
             k = k_.flatten(start_dim=-2).contiguous()
             v = v_.flatten(start_dim=-2).contiguous()
+            if self.attn.layer_id == 0:
+                print(f"q shape={q.shape}, k shape={k.shape}, v shape={v.shape}")
 
-            attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.scaling)
-            # attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+            # attn_output = self.forward_normal_core_fusionrag(q, k, v, forward_batch, self.scaling)
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
 
         else:
             attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
@@ -479,7 +479,7 @@ class Qwen2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
-        # self.fix_rope_test(forward_batch)
+        self.fix_rope_test(forward_batch)
         # self.save_for_debug(forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:

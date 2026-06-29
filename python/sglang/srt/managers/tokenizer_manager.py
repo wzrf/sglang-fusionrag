@@ -672,7 +672,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             else:
                 highlighted_tokens.append(token)
         highlighted_with_spaces = "".join(highlighted_tokens)
-        print(f"mengyao_debug highlight_recompute_tokens=\n{highlighted_with_spaces}")
+        if len(recompute_str_list) >2:
+            print(f"mengyao_debug highlight_recompute_tokens=\n{highlighted_with_spaces}")
 
 
     async def _find_recompute_token_in_one_request(

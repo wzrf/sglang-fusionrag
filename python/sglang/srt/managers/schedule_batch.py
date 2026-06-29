@@ -939,7 +939,7 @@ class Req:
                 self.host_hit_length = match_result.host_hit_length
                 self.prefix_indices = match_result.device_indices ## empty
                 if match_result.no_need_to_run:
-                    print(f"req doesn't need to be run.")
+                    # print(f"req doesn't need to be run.")
                     self.no_need_to_run = True
 
             else:

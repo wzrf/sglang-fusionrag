@@ -582,9 +582,9 @@ class FusionragCache(RadixCache):
                     prefix_text = params.key.prefix_prompt_text
                     text_without_prefix = params.key.origin_input_text[len(prefix_text):]
                     if text_without_prefix == node.text_without_prefix:
-                        print(f"kv gen already run before\ntext={text_without_prefix}\n"
-                              f"prefix={prefix_text}\n"
-                              f"is_preprocess_cache={node.is_preprocess_cache}")
+                        # print(f"kv gen already run before\ntext={text_without_prefix}\n"
+                        #       f"prefix={prefix_text}\n"
+                        #       f"is_preprocess_cache={node.is_preprocess_cache}")
                         return MatchResult(
                             device_indices=torch.empty(
                                 (0,),
@@ -613,16 +613,16 @@ class FusionragCache(RadixCache):
                 ## 找到和preprocess/raw 匹配的nodes
                 if node.is_preprocess_cache == params.key.use_preprocess_kv_cache:
                     if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
-                        print(f"load text: {node.text_without_prefix[:20]}, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
+                        # print(f"load text: {node.text_without_prefix[:20]}, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
-                        print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
-                        print(f"host_value={len(node.host_value)}")
-                        try:
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
-                        except Exception as e:
-                            print(f"match_idx={match_idx}")
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
+                        # print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
+                        # print(f"host_value={len(node.host_value)}")
+                        # try:
+                        #     print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
+                        # except Exception as e:
+                        #     print(f"match_idx={match_idx}")
+                        #     print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
                         input_text = input_text[len(node.text_without_prefix) :]
                         last_round_found = True
                         break
