@@ -124,7 +124,7 @@ class ChunkNode:
 
 class FusionragCache(RadixCache):
 
-    def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+    def __init__(self, params: CacheInitParams, server_args: ServerArgs, tp_rank: int, tp_size: int):
         if server_args.hicache_io_backend == "direct":
             # FIXME: move this logic into server_args parsing
             if server_args.hicache_mem_layout == "page_first":
@@ -135,6 +135,8 @@ class FusionragCache(RadixCache):
 
         if not server_args.disable_hicache_numa_detect:
             bind_to_closest_numa_node_cuda()
+
+        print(f"FusionragCache tp_rank = {tp_rank}")
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -162,6 +164,8 @@ class FusionragCache(RadixCache):
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
@@ -262,13 +266,15 @@ class FusionragCache(RadixCache):
                         cache_prefix_token_len = metadata.get("cache_prefix_token_len", "")
                         prefix_text = metadata.get("prefix_text", "")
                         text_without_prefix_ids = metadata.get("text_without_prefix_ids", "")
+                        tp_rank = metadata.get("tp_rank", -1)
                         result.append(
                             (text_without_prefix,
                              os.path.join(folder_path, f"{folder}.pt"),
                              cache_prefix_token_len,
                              prefix_text,
                              use_preprocess_cache,
-                             text_without_prefix_ids)
+                             text_without_prefix_ids,
+                             tp_rank)
                         )
 
                     except (json.JSONDecodeError, KeyError) as e:
@@ -289,8 +295,12 @@ class FusionragCache(RadixCache):
             prefix_text = all_chunk_cache[3]
             is_preprocess_cache = all_chunk_cache[4]
             text_without_prefix_ids = all_chunk_cache[5]
+            tp_rank = all_chunk_cache[6]
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[2]
+
+            if tp_rank != self.tp_rank:
+                continue
             try:
                 ##fixme mengyao_debug: this is the qwen cache
                 if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[1]:
@@ -730,7 +740,7 @@ class FusionragCache(RadixCache):
         ""
 
     ## fixme： 对于kvcache，在这里保存到ssd，并且保存到treecache里面；对于非kvcache，evict树；
-    def cache_finished_req(self, req: Req, tp_rank=0, is_insert: bool = True) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         if req.is_kv_gen and req.save_preprocess_cache:
             print(f"save preprocess cache") ## for debug
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
@@ -772,12 +782,8 @@ class FusionragCache(RadixCache):
             prompt_ids = req.origin_input_ids
             prefix_prompt_ids = req.kv_gen_prefix_len
             prompt_ids_without_prefix = prompt_ids[prefix_prompt_ids:]
-            if tp_rank == 0:
-                print(f"tp_rank={tp_rank}, saving to disk.")
-                self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
-                                          prompt_ids_without_prefix) ## 不存储prefix部分
-            else:
-                print(f"tp_rank={tp_rank}, NOT saving to disk.")
+            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
+                                      prompt_ids_without_prefix)  ## 不存储prefix部分
 
             ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
             kv_committed_len = req.pop_committed_kv_cache()
@@ -799,7 +805,8 @@ class FusionragCache(RadixCache):
 
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 
-    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor, kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
+    def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor,
+                             kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
         k_cache = []
         v_cache = []
         for layer_id in range(self.kv_cache.layer_num):
@@ -815,6 +822,7 @@ class FusionragCache(RadixCache):
         prefix_prompt = req.prefix_prompt
         cache_prefix_token_len = kv_prefix_len
         metadata = {
+            "tp_rank": self.tp_rank,
             "text": text[len(prefix_prompt):],  ## only save the document itself.
             "cache_prefix_token_len": cache_prefix_token_len,
             "prefix_text": prefix_prompt,
@@ -822,6 +830,8 @@ class FusionragCache(RadixCache):
         }
         ## 同步执行环境，不存在锁的问题
         md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
+        if self.tp_size > 1:
+            md5_hash=f"{md5_hash}_{self.tp_rank}"
         if req.save_preprocess_cache is True:
             passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
             logger.error(

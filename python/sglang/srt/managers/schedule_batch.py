@@ -1728,6 +1728,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
+                print(f"req.origin_input_ids={len(req.origin_input_ids)}")
+                print(f"req.logprob_start_len={req.logprob_start_len}")
+                print(f"req.fill_ids={len(req.fill_ids)}")
+                print(f"req.prefix_indices={len(req.prefix_indices)}")
+
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
@@ -1738,6 +1743,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         - len(logprob_token_ids)
                     )
                 )
+                print(f"req.extend_input_len={req.extend_input_len}")
+                print(f"req.extend_logprob_start_len={req.extend_logprob_start_len}")
+                print(f"logprob_token_ids={logprob_token_ids}")
+                print(f"extend_input_logprob_token_ids len={len(extend_input_logprob_token_ids)}")
+
+        print(f"extend_input_logprob_token_ids final len={len(extend_input_logprob_token_ids)}")
 
         if self.return_logprob:
             extend_input_logprob_token_ids = torch.tensor(

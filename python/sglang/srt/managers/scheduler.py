@@ -697,7 +697,7 @@ class Scheduler(
                 from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
 
                 self.tree_cache_hicache = HiRadixCache(params=params, server_args=server_args)
-                self.tree_cache_fusionrag = FusionragCache(params=params, server_args=server_args) ##mengyao_debug hardcode
+                self.tree_cache_fusionrag = FusionragCache(params=params, server_args=server_args, tp_rank=self.tp_rank, tp_size=self.tp_size) ##mengyao_debug hardcode
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache_hicache.cache_controller.layer_done_counter
                 )
@@ -1642,10 +1642,12 @@ class Scheduler(
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
                 req.logprob_start_len = len(req.origin_input_ids) - 1
+                print(f"{req.rid} return logprob, logprob_start_len={req.logprob_start_len}")
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
+                print(f"{req.rid} is prefill only, logprob_start_len={req.logprob_start_len}")
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1

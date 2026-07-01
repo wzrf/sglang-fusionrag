@@ -575,7 +575,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                self.tree_cache_fusionrag.cache_finished_req(req, tp_rank=self.tp_rank)
+                self.tree_cache_fusionrag.cache_finished_req(req)
                 release_kv_cache(req, self.tree_cache_hicache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
@@ -591,7 +591,7 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                self.tree_cache_fusionrag.cache_finished_req(req, tp_rank=self.tp_rank)
+                self.tree_cache_fusionrag.cache_finished_req(req)
                 release_kv_cache(req, self.tree_cache_hicache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
