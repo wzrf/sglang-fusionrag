@@ -81,6 +81,7 @@ class ChunkNode:
         # priority for priority-aware eviction
         self.priority = priority
         self.is_preprocess_cache = False ## false is raw cache, true is preprocess cache
+        self.preprocess_cache_key = "" ## 用来区别不同副本的cache key
         self.text_without_prefix_ids: List[int] = []
 
         self.id = ChunkNode.counter if id is None else id
@@ -267,14 +268,21 @@ class FusionragCache(RadixCache):
                         prefix_text = metadata.get("prefix_text", "")
                         text_without_prefix_ids = metadata.get("text_without_prefix_ids", "")
                         tp_rank = metadata.get("tp_rank", -1)
+                        preprocess_cache_key = metadata.get("preprocess_cache_key", "")
+                        if "_" in folder:
+                            torch_name = folder.split("_")[-1] ##对于preprocess，folder = preprocess_cache_key_md5
+                        else:
+                            torch_name = folder
                         result.append(
                             (text_without_prefix,
-                             os.path.join(folder_path, f"{folder}.pt"),
+                             os.path.join(folder_path, f"{torch_name}.pt"),
                              cache_prefix_token_len,
                              prefix_text,
                              use_preprocess_cache,
                              text_without_prefix_ids,
-                             tp_rank)
+                             tp_rank,
+                             preprocess_cache_key
+                             )
                         )
 
                     except (json.JSONDecodeError, KeyError) as e:
@@ -296,6 +304,9 @@ class FusionragCache(RadixCache):
             is_preprocess_cache = all_chunk_cache[4]
             text_without_prefix_ids = all_chunk_cache[5]
             tp_rank = all_chunk_cache[6]
+            preprocess_cache_key = all_chunk_cache[7]
+            if preprocess_cache_key != "":
+                print(f"preprocess cache key {preprocess_cache_key}")
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[2]
 
@@ -321,6 +332,7 @@ class FusionragCache(RadixCache):
                 node.host_value = host_indices
                 node.values = []
                 node.text_without_prefix_ids = text_without_prefix_ids
+                node.preprocess_cache_key = preprocess_cache_key
                 self.all_nodes.append(node)
             except Exception as e:
                 print(f"unsupport layout detected. e={e}, preprocess_chunk_caches={preprocess_chunk_caches}")
@@ -597,6 +609,10 @@ class FusionragCache(RadixCache):
         if params.key.is_kv_gen:
             for node in self.all_nodes:
                 if node.is_preprocess_cache == params.key.is_preprocess_kv_gen:
+                    if node.is_preprocess_cache:
+                        ## 必须preprocess_cache_key相等才算是生成过；
+                        if node.preprocess_cache_key != params.key.preprocess_cache_key:
+                            continue
                     prefix_text = params.key.prefix_prompt_text
                     text_without_prefix = params.key.origin_input_text[len(prefix_text):]
                     if text_without_prefix == node.text_without_prefix:
@@ -625,19 +641,33 @@ class FusionragCache(RadixCache):
         match_idx = 0
         if params.key.use_preprocess_kv_cache == True:
             print(f"use preprocess cache") ## for debug
+        preprocess_cache_key_list = params.key.preprocess_cache_key_list
+        cache_is_preprocess_list = params.key.cache_is_preprocess_list
         while len(input_text) > 0 and last_round_found:
             last_round_found = False
+            if cache_is_preprocess_list is None:
+                use_preprocess_kv_cache = params.key.use_preprocess_kv_cache
+            else:
+                use_preprocess_kv_cache = cache_is_preprocess_list[match_idx]
             for node in self.all_nodes:
                 ## 找到和preprocess/raw 匹配的nodes
-                if node.is_preprocess_cache == params.key.use_preprocess_kv_cache:
+                if node.is_preprocess_cache == use_preprocess_kv_cache:
+                    ##fixme: 在preprocess下可能有多个副本，首先判断对应的preprocess_cache_key是不是skip，如果不是的话需要检查
+                    ## cache的preprocess_cache_key和preprocess_cache_key_list[match_idx]是否相同，不同则跳过；
+                    if use_preprocess_kv_cache:
+                        if preprocess_cache_key_list is not None and preprocess_cache_key_list[match_idx] != "skip":
+                            if node.preprocess_cache_key != params.key.preprocess_cache_key_list[match_idx]:
+                                continue
                     if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
-                        print(f"load text: {node.text_without_prefix[:20]}, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
+                        print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
                         print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
                         print(f"host_value={len(node.host_value)}")
+                        if node.preprocess_cache_key != "":
+                            print(f"match_idx={match_idx} preprocess_cache_key={node.preprocess_cache_key}")
                         try:
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
+                            print(f"match_idx={match_idx} prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
                         except Exception as e:
                             print(f"match_idx={match_idx}")
                             print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
@@ -668,6 +698,7 @@ class FusionragCache(RadixCache):
         is_kv_gen: bool = False,
         kv_gen_prefix_len: int = 0,
         is_preprocess_cache: bool = False,
+        preprocess_cache_key: str = "",
         text_without_prefix_ids: List[int] = None
     ):
         if is_kv_gen:
@@ -680,6 +711,7 @@ class FusionragCache(RadixCache):
             node.priority = priority
             node.cache_prefix_token_len = kv_gen_prefix_len
             node.is_preprocess_cache = is_preprocess_cache
+            node.preprocess_cache_key = preprocess_cache_key
             target_len = len(node.text_without_prefix)
             pos = bisect.bisect_left(
                 self.all_nodes,
@@ -747,7 +779,8 @@ class FusionragCache(RadixCache):
         logger.error(
             f"fusionrag cache_finished_req: rid={req.rid} "
             f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
-            f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run}"
+            f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run} "
+            f"preprocess_cache_key={req.preprocess_cache_key}"
         )
         if req.no_need_to_run:
             return
@@ -777,6 +810,7 @@ class FusionragCache(RadixCache):
                 is_kv_gen=True,
                 kv_gen_prefix_len=kv_prefix_len,
                 is_preprocess_cache=req.save_preprocess_cache,
+                preprocess_cache_key=req.preprocess_cache_key,
                 text_without_prefix_ids=text_without_prefix_ids
             )
             prompt_ids = req.origin_input_ids
@@ -827,13 +861,17 @@ class FusionragCache(RadixCache):
             "cache_prefix_token_len": cache_prefix_token_len,
             "prefix_text": prefix_prompt,
             "text_without_prefix_ids": text_without_prefix_ids,
+            "preprocess_cache_key": req.preprocess_cache_key
         }
         ## 同步执行环境，不存在锁的问题
         md5_hash = hashlib.md5(text[len(prefix_prompt):].encode('utf-8')).hexdigest()
         if self.tp_size > 1:
             md5_hash=f"{md5_hash}_{self.tp_rank}"
         if req.save_preprocess_cache is True:
-            passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
+            if req.preprocess_cache_key == "":
+                passage_kv_path = f"{self.preprocess_cache_path}/{md5_hash}"
+            else:
+                passage_kv_path = f"{self.preprocess_cache_path}/{req.preprocess_cache_key}_{md5_hash}"
             logger.error(
                 "save to PREPROCESS cache\n"
                 f"text=\n{text[len(prefix_prompt):]}\n"

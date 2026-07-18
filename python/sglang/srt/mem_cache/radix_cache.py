@@ -76,6 +76,9 @@ class RadixKey:
         is_preprocess_kv_gen: bool = False,
         use_preprocess_kv_cache: bool = False,
         prefix_prompt_ids_list: List[List[int]] = None,
+        preprocess_cache_key: str = "",
+        preprocess_cache_key_list: list[str] = None,
+        cache_is_preprocess_list: list[bool] = None,
     ):
         # token ids sequence
         self.token_ids = token_ids
@@ -89,6 +92,9 @@ class RadixKey:
         self.is_preprocess_kv_gen = is_preprocess_kv_gen ## 生成 preprocess kv cache
         self.use_preprocess_kv_cache = use_preprocess_kv_cache ## 使用 preprocess kv cache
         self.prefix_prompt_ids_list = prefix_prompt_ids_list
+        self.preprocess_cache_key = preprocess_cache_key
+        self.preprocess_cache_key_list = preprocess_cache_key_list
+        self.cache_is_preprocess_list = cache_is_preprocess_list
     def __len__(self) -> int:
         return len(self.token_ids)
 

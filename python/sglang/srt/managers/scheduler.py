@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import copy
 import psutil
 import setproctitle
 import torch
@@ -696,7 +697,9 @@ class Scheduler(
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
                 from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
 
-                self.tree_cache_hicache = HiRadixCache(params=params, server_args=server_args)
+                server_args_hicache = copy.deepcopy(server_args)
+                server_args_hicache.hicache_size = 20
+                self.tree_cache_hicache = HiRadixCache(params=params, server_args=server_args_hicache)
                 self.tree_cache_fusionrag = FusionragCache(params=params, server_args=server_args, tp_rank=self.tp_rank, tp_size=self.tp_size) ##mengyao_debug hardcode
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache_hicache.cache_controller.layer_done_counter

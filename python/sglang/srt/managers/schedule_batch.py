@@ -563,6 +563,9 @@ class Req(ReqDllmMixin):
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
+            self.preprocess_cache_key = fusionrag_params.get("preprocess_cache_key", "")
+            self.preprocess_cache_key_list = fusionrag_params.get("preprocess_cache_key_list", None)
+            self.cache_is_preprocess_list = fusionrag_params.get("cache_is_preprocess_list", None)
             self.recompute_idx = fusionrag_params.get("recompute_idx", [])
             self.recompute_idx_origin = copy.deepcopy(self.recompute_idx)
             self.save_raw_cache = not self.save_preprocess_cache
@@ -580,6 +583,9 @@ class Req(ReqDllmMixin):
             self.kv_gen_prefix_len = 0
             self.prefix_prompt = ""
             self.save_preprocess_cache = False
+            self.preprocess_cache_key = None
+            self.preprocess_cache_key_list = None
+            self.cache_is_preprocess_list = None
             self.save_raw_cache = False
             self.use_preprocess_cache = False
             self.recompute_idx = []
@@ -940,7 +946,10 @@ class Req(ReqDllmMixin):
                                  is_kv_gen=self.is_kv_gen,
                                  is_preprocess_kv_gen=self.save_preprocess_cache,
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
-                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list,
+                                 preprocess_cache_key=self.preprocess_cache_key,
+                                 preprocess_cache_key_list=self.preprocess_cache_key_list,
+                                 cache_is_preprocess_list=self.cache_is_preprocess_list
                                  ),
                     req=self if tree_cache_fusionrag.supports_mamba() else None,
                     cow_mamba=tree_cache_fusionrag.supports_mamba(),
@@ -997,7 +1006,10 @@ class Req(ReqDllmMixin):
                                  is_kv_gen=self.is_kv_gen,
                                  is_preprocess_kv_gen=self.save_preprocess_cache,
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
-                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list,
+                                 preprocess_cache_key=self.preprocess_cache_key,
+                                 preprocess_cache_key_list=self.preprocess_cache_key_list,
+                                 cache_is_preprocess_list=self.cache_is_preprocess_list
                                  ),
                     req=self if tree_cache_hicache.supports_mamba() else None,
                     cow_mamba=tree_cache_hicache.supports_mamba(),
