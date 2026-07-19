@@ -744,6 +744,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prompt_ids_list"] = prompt_ids_list
                     ## 重新赋值input_ids
                     input_ids = [num for sublist in prompt_ids_list for num in sublist]
+                    print(f"tokenize one request mengyao_debug input_ids={len(input_ids)}")
                 else:
                     print(f"mengyao_debug prompt_list should be in params.")
 
@@ -758,6 +759,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prefix_prompt_ids_list"] = prefix_prompt_ids_list
                     prefix_prompt_ids = [num for sublist in prefix_prompt_ids_list for num in sublist]
                     obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
+                    print(f"tokenize one request mengyao_debug prefix_prompt_ids={len(prefix_prompt_ids)}")
                 else:
                     print(f"mengyao_debug prefix_prompt_list should be in params.")
 
@@ -807,9 +809,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
-                )
+                if len(input_ids) == 0: ##fixme: mengyao_debug 这里不知道是什么bug
+                    input_ids, token_type_ids = await self._tokenize_texts(
+                        input_text, is_cross_encoder_request
+                    )
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -1601,6 +1604,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
+                "recomputation_rate": recv_obj.recomputation_rates[i],
             }
 
             if self.enable_metrics:

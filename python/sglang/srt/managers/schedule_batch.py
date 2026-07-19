@@ -532,6 +532,7 @@ class Req(ReqDllmMixin):
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+        print(f"origin_input_ids={len(origin_input_ids)}")
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -692,6 +693,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.host_hit_length_hicache = 0
         self.host_hit_length_fusionrag = 0
+        self.recomputation_rate = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -1571,6 +1573,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
+            print(f"r.prefix_indices len = {len(r.prefix_indices)}\n r.fill_ids len = {len(r.fill_ids)}")
             r.all_compute_idx.extend(extend_compute_idx)
             ## mengyao_debug: just in case it overlaps
             r.all_compute_idx = sorted(set(r.all_compute_idx))
@@ -1579,6 +1582,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 print(f"mengyao_debug This is a DECODER TASK")
             if r.host_hit_length_fusionrag >0:
+                r.recomputation_rate = len(r.recompute_idx) / r.host_hit_length_fusionrag
                 print(f"mengyao_debug recompute percentage="
                       f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
                 # torch.set_printoptions(threshold=10000)
@@ -1587,6 +1591,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug recompute_idx={r.recompute_idx}")
                 # torch.set_printoptions(threshold=1000)
             else:
+                r.recomputation_rate = 1
                 print(f"mengyao_debug compute percentage=100%")
             print(f"r.all_compute_idx = {r.all_compute_idx}")
             print(f"r.fill_ids = {len(r.fill_ids)}")

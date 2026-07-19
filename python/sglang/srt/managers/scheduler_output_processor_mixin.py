@@ -905,6 +905,7 @@ class SchedulerOutputProcessorMixin:
         decode_ids_list = []
         read_offsets = []
         output_ids = []
+        recomputation_rates = []
 
         skip_special_tokens = []
         spaces_between_special_tokens = []
@@ -1013,6 +1014,7 @@ class SchedulerOutputProcessorMixin:
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 output_ids.append(output_ids_[send_token_offset:])
+                recomputation_rates.append(req.recomputation_rate)
                 req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
@@ -1144,6 +1146,7 @@ class SchedulerOutputProcessorMixin:
                     decode_ids=decode_ids_list,
                     read_offsets=read_offsets,
                     output_ids=output_ids,
+                    recomputation_rates=recomputation_rates,
                     skip_special_tokens=skip_special_tokens,
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,

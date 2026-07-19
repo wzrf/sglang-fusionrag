@@ -305,8 +305,8 @@ class FusionragCache(RadixCache):
             text_without_prefix_ids = all_chunk_cache[5]
             tp_rank = all_chunk_cache[6]
             preprocess_cache_key = all_chunk_cache[7]
-            if preprocess_cache_key != "":
-                print(f"preprocess cache key {preprocess_cache_key}")
+            # if preprocess_cache_key != "":
+                # print(f"preprocess cache key {preprocess_cache_key}")
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
             prefetch_length = chunk_tensor.shape[2]
 
@@ -875,7 +875,8 @@ class FusionragCache(RadixCache):
             logger.error(
                 "save to PREPROCESS cache\n"
                 f"text=\n{text[len(prefix_prompt):]}\n"
-                f"prefix=\n{prefix_prompt}"
+                f"prefix=\n{prefix_prompt}\n"
+                f"passage_kv_path={passage_kv_path}"
             )
         elif req.save_raw_cache is True:
             passage_kv_path = f"{self.cache_path}/{md5_hash}"
