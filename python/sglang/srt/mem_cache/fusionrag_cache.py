@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import glob
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -269,13 +270,17 @@ class FusionragCache(RadixCache):
                         text_without_prefix_ids = metadata.get("text_without_prefix_ids", "")
                         tp_rank = metadata.get("tp_rank", -1)
                         preprocess_cache_key = metadata.get("preprocess_cache_key", "")
-                        if "_" in folder:
-                            torch_name = folder.split("_")[-1] ##对于preprocess，folder = preprocess_cache_key_md5
-                        else:
-                            torch_name = folder
+                        # if "_" in folder:
+                        #     torch_name = folder.split("_")[-1] ##对于preprocess，folder = preprocess_cache_key_md5
+                        # else:
+                        #     torch_name = folder
+                        pt_files = glob.glob(os.path.join(folder_path, "*.pt"))
+                        if not pt_files:
+                            raise FileNotFoundError(f"目录 {folder_path} 下没有找到任何 .pt 文件")
+                        pt_file_path = pt_files[0]
                         result.append(
                             (text_without_prefix,
-                             os.path.join(folder_path, f"{torch_name}.pt"),
+                             pt_file_path,
                              cache_prefix_token_len,
                              prefix_text,
                              use_preprocess_cache,
