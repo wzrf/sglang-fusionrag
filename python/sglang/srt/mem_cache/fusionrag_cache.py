@@ -846,17 +846,24 @@ class FusionragCache(RadixCache):
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor,
                              kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
-        k_cache = []
-        v_cache = []
+        # k_cache = []
+        # v_cache = []
+        # for layer_id in range(self.kv_cache.layer_num):
+        #     k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
+        #     v_buffer = self.kv_cache.get_value_buffer(layer_id)[kv_indices_].to('cpu')
+        #     k_cache.append(k_buffer)
+        #     v_cache.append(v_buffer)
+        # k_caches = torch.stack(k_cache, dim=0)
+        # v_caches = torch.stack(v_cache, dim=0)
+        # ##fixme mengyao_debug: this is the qwen cache
+        # kv_cache = torch.stack([k_caches, v_caches], dim=0)
+
+        kv_cache = []
         for layer_id in range(self.kv_cache.layer_num):
             k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
-            v_buffer = self.kv_cache.get_value_buffer(layer_id)[kv_indices_].to('cpu')
-            k_cache.append(k_buffer)
-            v_cache.append(v_buffer)
-        k_caches = torch.stack(k_cache, dim=0)
-        v_caches = torch.stack(v_cache, dim=0)
-        ##fixme mengyao_debug: this is the qwen cache
-        kv_cache = torch.stack([k_caches, v_caches], dim=0)
+            kv_cache.append(k_buffer)
+        kv_cache = torch.stack(kv_cache, dim=0)
+
         text = req.origin_input_text
         prefix_prompt = req.prefix_prompt
         cache_prefix_token_len = kv_prefix_len

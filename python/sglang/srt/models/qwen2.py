@@ -453,7 +453,7 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-
+        # self.fix_rope_test_after_preprocess(forward_batch)
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -546,6 +546,43 @@ class Qwen2Model(nn.Module):
                             cache_k=k_rope,
                             cache_v=v,
                         )
+        forward_batch.rope_fixed = True
+
+
+    def fix_rope_test_after_preprocess(
+        self,
+        forward_batch
+    ):
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        for req in forward_batch.reqs:
+            if not req.is_kv_gen:
+                continue
+            if not req.save_preprocess_cache:
+                continue
+
+            kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            origin_len = len(kv_indices)
+            kv_indices_cache = kv_indices[req.kv_gen_prefix_len: ]
+            original_position=torch.arange(req.kv_gen_prefix_len, origin_len)
+            zero_position = torch.arange(0, origin_len-req.kv_gen_prefix_len)
+            for layer_id, layer in enumerate(self.layers):
+                k_, v_ = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+                k = k_[kv_indices_cache]
+                v = v_[kv_indices_cache]
+
+                k_rope = correct_rope_rotation(k,
+                                               layer.self_attn.rotary_emb.cos_sin_cache,
+                                               wrong_positions=original_position,
+                                               correct_positions=zero_position)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer=layer.self_attn.attn,
+                    loc=kv_indices_cache,
+                    cache_k=k_rope,
+                    cache_v=v,
+                )
         forward_batch.rope_fixed = True
 
 

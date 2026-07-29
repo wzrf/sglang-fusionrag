@@ -2636,7 +2636,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        # config.num_hidden_layers = 4
+        # config.num_hidden_layers = 3
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -2746,8 +2746,8 @@ class DeepseekV2Model(nn.Module):
             self.preprocess_cache_path = f"{cache_path_root}/shm/fusionrag/DeepSeek-v3.2_tp_{tp_size_}/preprocess_kv_cache"
 
         print(f"cache_path = {self.cache_path}")
-        os.makedirs(self.cache_path, exist_ok=True)
-        os.makedirs(self.preprocess_cache_path, exist_ok=True)
+        # os.makedirs(self.cache_path, exist_ok=True)
+        # os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2924,6 +2924,8 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        # self.fix_rope_test_after_preprocess(forward_batch)
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -3016,6 +3018,45 @@ class DeepseekV2Model(nn.Module):
                         torch.save(kv_cache, f'{passage_kv_path}/{md5_hash}.pt')
 
         ""
+
+    def fix_rope_test_after_preprocess(
+        self,
+        forward_batch
+    ):
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+        for req in forward_batch.reqs:
+            if not req.is_kv_gen:
+                continue
+            if not req.save_preprocess_cache:
+                continue
+
+            kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+            origin_len = len(kv_indices)
+            kv_indices_cache = kv_indices[req.kv_gen_prefix_len: ]
+            original_position=torch.arange(req.kv_gen_prefix_len, origin_len)
+            zero_position = torch.arange(0, origin_len-req.kv_gen_prefix_len)
+            for layer_id, layer in enumerate(self.layers):
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[kv_indices_cache, :, :]
+                k = k_buffer[:, :, :512]
+                k_rope = k_buffer[:, :, 512:]
+                layer = self.layers[layer_id]
+                k_rope = correct_rope_rotation(k_rope,
+                                               layer.self_attn.rotary_emb.cos_sin_cache,
+                                               wrong_positions=original_position,
+                                               correct_positions=zero_position)
+                # if layer_id == 0:
+                #     print(
+                #         f"[fix_rope_test] fix rope_rotation, {original_position} -> {zero_position}")
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer.self_attn.attn_mha,
+                    kv_indices_cache,
+                    k,
+                    k_rope,
+                )
+        forward_batch.rope_fixed = True
 
     ##todo: triton
     def fix_rope_test(

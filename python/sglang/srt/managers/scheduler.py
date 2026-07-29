@@ -698,7 +698,7 @@ class Scheduler(
                 from sglang.srt.mem_cache.fusionrag_cache import FusionragCache
 
                 server_args_hicache = copy.deepcopy(server_args)
-                server_args_hicache.hicache_size = 20
+                server_args_hicache.hicache_size = 40
                 self.tree_cache_hicache = HiRadixCache(params=params, server_args=server_args_hicache)
                 self.tree_cache_fusionrag = FusionragCache(params=params, server_args=server_args, tp_rank=self.tp_rank, tp_size=self.tp_size) ##mengyao_debug hardcode
                 self.tp_worker.register_hicache_layer_transfer_counter(
