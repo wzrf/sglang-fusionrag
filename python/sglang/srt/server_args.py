@@ -535,6 +535,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
+    fusionrag_cache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -4354,6 +4355,12 @@ class ServerArgs:
             "--hicache-size",
             type=int,
             default=ServerArgs.hicache_size,
+            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--fusionrag-cache-size",
+            type=int,
+            default=ServerArgs.fusionrag_cache_size,
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         )
         parser.add_argument(

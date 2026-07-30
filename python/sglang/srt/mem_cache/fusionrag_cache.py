@@ -142,6 +142,8 @@ class FusionragCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.use_qwen = False
+        self.use_deepseek = False
 
         if isinstance(self.kv_cache, MHATokenToKVPool): # QWEN用的是这个？
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -152,6 +154,7 @@ class FusionragCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+            self.use_qwen = True
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -161,6 +164,7 @@ class FusionragCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+            self.use_deepseek = True
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
@@ -318,8 +322,11 @@ class FusionragCache(RadixCache):
             if tp_rank != self.tp_rank:
                 continue
             try:
-                ##fixme mengyao_debug: this is the qwen cache
-                if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[1]:
+                if self.use_qwen:
+                    layer_idx = 1
+                elif self.use_deepseek:
+                    layer_idx = 0
+                if self.cache_controller.mem_pool_host.layer_num != chunk_tensor.shape[layer_idx]: ##fixme: qwen(1) vs deepseek/kimi(0)
                     print(f"shape mismatch. chunk_tensor shape = {chunk_tensor.shape}, layer_num = {self.cache_controller.mem_pool_host.layer_num}")
                     continue
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -846,23 +853,24 @@ class FusionragCache(RadixCache):
 
     def _write_cache_to_disk(self, req: Req, kv_indices_: torch.Tensor,
                              kv_prefix_len: int, text_without_prefix_ids: List[int]) -> None:
-        # k_cache = []
-        # v_cache = []
-        # for layer_id in range(self.kv_cache.layer_num):
-        #     k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
-        #     v_buffer = self.kv_cache.get_value_buffer(layer_id)[kv_indices_].to('cpu')
-        #     k_cache.append(k_buffer)
-        #     v_cache.append(v_buffer)
-        # k_caches = torch.stack(k_cache, dim=0)
-        # v_caches = torch.stack(v_cache, dim=0)
-        # ##fixme mengyao_debug: this is the qwen cache
-        # kv_cache = torch.stack([k_caches, v_caches], dim=0)
+        if self.use_qwen:
+            k_cache = []
+            v_cache = []
+            for layer_id in range(self.kv_cache.layer_num):
+                k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
+                v_buffer = self.kv_cache.get_value_buffer(layer_id)[kv_indices_].to('cpu')
+                k_cache.append(k_buffer)
+                v_cache.append(v_buffer)
+            k_caches = torch.stack(k_cache, dim=0)
+            v_caches = torch.stack(v_cache, dim=0)
+            kv_cache = torch.stack([k_caches, v_caches], dim=0)
 
-        kv_cache = []
-        for layer_id in range(self.kv_cache.layer_num):
-            k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
-            kv_cache.append(k_buffer)
-        kv_cache = torch.stack(kv_cache, dim=0)
+        elif self.use_deepseek:
+            kv_cache = []
+            for layer_id in range(self.kv_cache.layer_num):
+                k_buffer = self.kv_cache.get_key_buffer(layer_id)[kv_indices_].to('cpu')
+                kv_cache.append(k_buffer)
+            kv_cache = torch.stack(kv_cache, dim=0)
 
         text = req.origin_input_text
         prefix_prompt = req.prefix_prompt

@@ -2636,7 +2636,9 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        # config.num_hidden_layers = 3
+        if os.environ.get("DEBUG", "0") == "1":
+            config.num_hidden_layers = 3
+        print(f"[DeepseekV2Model] num_hidden_layers={config.num_hidden_layers}")
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(

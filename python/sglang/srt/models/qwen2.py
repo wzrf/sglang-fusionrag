@@ -375,25 +375,6 @@ class Qwen2Model(nn.Module):
         self.layers_to_capture = []
 
         tp_size_ = get_tensor_model_parallel_world_size()
-        cache_path_root = "/mnt/data3"
-        # if not os.path.exists(cache_path_root):
-        #     cache_path_root = "/mnt/data"
-        model_name = getattr(config, "model_type", "qwen2")
-        model_name = model_name.replace("/", "_")
-        self.cache_path = f"/mnt/data3/shm/fusionrag/{model_name}/raw_kv_cache"
-        self.preprocess_cache_path = (
-            f"/mnt/data3/shm/fusionrag/{model_name}/preprocess_kv_cache"
-        )
-        if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = (
-                f"/mnt/data3/shm/fusionrag/{model_name}_tp_{tp_size_}/raw_kv_cache"
-            )
-            self.preprocess_cache_path = (
-                f"/mnt/data3/shm/fusionrag/{model_name}_tp_{tp_size_}/preprocess_kv_cache"
-            )
-
-        # os.makedirs(self.cache_path, exist_ok=True)
-        # os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
