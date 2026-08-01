@@ -297,7 +297,7 @@ class DeepseekMHAForwardMixin:
                         # torch.set_printoptions(threshold=1000)
                         # raise "HAS DUPLICATES" ## it's normal for agent case, when they have common prefix.
                     if has_duplicates(forward_batch.out_cache_loc):
-                        # torch.set_printoptions(threshold=10000)
+                        torch.set_printoptions(threshold=10000)
                         print(f"mengyao_debug out_cache_loc HAS DUPLICATES, out_cache_loc={forward_batch.out_cache_loc}")
                         # torch.set_printoptions(threshold=1000)
                         raise "HAS DUPLICATES"

@@ -489,6 +489,10 @@ AssertionError: parent does not have child key, 7801
         ## 目前这有bug，测试rag场景的时候需要把is_insert关掉
         # is_insert = False
 
+        if req.is_kv_gen and req.kv_gen_use_radix_prefix:
+            self.dec_lock_ref(req.last_node)
+            return
+
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

@@ -562,6 +562,7 @@ class Req(ReqDllmMixin):
             ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
             ## 3. is_kv_gen=False, load_preprocess_cache=True, 去preprocess cache 匹配
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
+            self.kv_gen_use_radix_prefix = fusionrag_params.get("kv_gen_use_radix_prefix", False)
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
             self.preprocess_cache_key = fusionrag_params.get("preprocess_cache_key", "")
@@ -581,6 +582,7 @@ class Req(ReqDllmMixin):
             fusionrag_params = None
         else:
             self.is_kv_gen = False
+            self.kv_gen_use_radix_prefix = False
             self.kv_gen_prefix_len = 0
             self.prefix_prompt = ""
             self.save_preprocess_cache = False
@@ -936,8 +938,46 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
 
+        if self.is_kv_gen and self.kv_gen_use_radix_prefix:
+            token_ids = self.fill_ids[:self.kv_gen_prefix_len]
+            match_result_prefix = tree_cache_hicache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids,
+                                 extra_key=self.extra_key,
+                                 origin_input_text=self.origin_input_text,
+                                 prefix_prompt_text=self.prefix_prompt,
+                                 is_kv_gen=self.is_kv_gen,
+                                 is_preprocess_kv_gen=self.save_preprocess_cache,
+                                 use_preprocess_kv_cache=self.use_preprocess_cache,
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 ),
+                    req=self if tree_cache_hicache.supports_mamba() else None,
+                    cow_mamba=tree_cache_hicache.supports_mamba(),
+                ),
+            )
+
+            (
+                self.prefix_indices_hicache,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length_hicache,
+                self.mamba_branching_seqlen,
+            ) = (
+                match_result_prefix.device_indices,
+                match_result_prefix.last_device_node,
+                match_result_prefix.last_host_node,
+                match_result_prefix.host_hit_length,
+                match_result_prefix.mamba_branching_seqlen,
+            )
+            print(f"[hiradix cache] req prefix_indices_hicache length = {len(self.prefix_indices_hicache)}, host_hit_length_hicache={self.host_hit_length_hicache}")
+            self.cache_protected_len = len(self.prefix_indices_hicache)
+
+            self.prefix_indices = self.prefix_indices_hicache ## mengyao_debug: in fusionrag cache this is empty.
+            self.host_hit_length = self.host_hit_length_fusionrag + self.host_hit_length_hicache
+            print(
+                f"[fusionrag cache] req host_hit_length length={self.host_hit_length_fusionrag}")
         ## if it's kv gen, only use fusion rag cache.
-        if self.is_kv_gen:
+        elif self.is_kv_gen:
             match_result = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
                     # key=RadixKey(token_ids=[], extra_key=self.extra_key), ## mengyao_debug I change this
@@ -964,7 +1004,8 @@ class Req(ReqDllmMixin):
                 print(f"req doesn't need to be run.")
                 self.no_need_to_run = True
         else:
-            if len(self.prefix_cache_ids) >= 0:
+            # if len(self.prefix_cache_ids) >= 0:
+            if len(self.prefix_cache_ids) > 0:
                 print(f"[hiradix cache] req prefix_cache_ids length = {len(self.prefix_cache_ids)}")
                 token_ids = self.fill_ids[:len(self.prefix_cache_ids)]
             match_result_prefix = tree_cache_hicache.match_prefix(

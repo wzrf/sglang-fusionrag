@@ -317,7 +317,10 @@ class FusionragCache(RadixCache):
             # if preprocess_cache_key != "":
                 # print(f"preprocess cache key {preprocess_cache_key}")
             chunk_tensor = torch.load(tensor_path, weights_only=True).to("cpu")
-            prefetch_length = chunk_tensor.shape[2]
+            if self.use_qwen:
+                prefetch_length = chunk_tensor.shape[2]
+            elif self.use_deepseek:
+                prefetch_length = chunk_tensor.shape[1]
 
             if tp_rank != self.tp_rank:
                 continue
@@ -347,7 +350,7 @@ class FusionragCache(RadixCache):
                 node.preprocess_cache_key = preprocess_cache_key
                 self.all_nodes.append(node)
             except Exception as e:
-                print(f"unsupport layout detected. e={e}, preprocess_chunk_caches={preprocess_chunk_caches}")
+                print(f"unsupport layout detected. e={e}, chunk_cache={all_chunk_cache}")
 
         ## sort.
         self.all_nodes.sort(key=lambda n: len(n.text_without_prefix), reverse=True)
@@ -837,7 +840,10 @@ class FusionragCache(RadixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
-            self.cache_controller.mem_pool_device_allocator.free(kv_indices)
+            if req.kv_gen_use_radix_prefix:
+                self.cache_controller.mem_pool_device_allocator.free(kv_indices[kv_prefix_len:]) ##mengyao_debug，如果前缀匹配的是radix cache，那么前缀部分不能释放
+            else:
+                self.cache_controller.mem_pool_device_allocator.free(kv_indices)
 
         for node_idx, node in enumerate(req.hit_chunk_nodes):
             value_to_remove = req.hit_chunk_values[node_idx].value

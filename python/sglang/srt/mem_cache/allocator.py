@@ -155,6 +155,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
+        torch.set_printoptions(threshold=10000)
+        print(f"mengyao_debug free_index={free_index}")
+        torch.set_printoptions(threshold=1000)
         if free_index.numel() == 0:
             return
 

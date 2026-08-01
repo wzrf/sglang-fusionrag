@@ -501,6 +501,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    ##mengyao_debug 依然要dec_lock_ref，不然radix cache释放不掉
+    if req.is_kv_gen and req.kv_gen_use_radix_prefix:
+        tree_cache.cache_finished_req(req, is_insert=is_insert)
     if not req.is_kv_gen:
         tree_cache.cache_finished_req(req, is_insert=is_insert)
 
