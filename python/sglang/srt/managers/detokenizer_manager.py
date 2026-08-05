@@ -222,6 +222,23 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return results
 
+    def _decode_batch_token_id_diffs(self, recv_obj: BatchTokenIDOutput):
+        for gap_ids in recv_obj.prefix_gap_ids:
+            gap_output = ""
+            if len(gap_ids) > 0:
+                gap_output = self.tokenizer.decode(
+                    gap_ids, skip_special_tokens=True, spaces_between_special_tokens=True
+                )
+            recv_obj.prefix_gap_strs.append(gap_output)
+        for gap_ids in recv_obj.prefix_gap_ids_with_before:
+            gap_output = ""
+            if len(gap_ids) > 0:
+                gap_output = self.tokenizer.decode(
+                    gap_ids, skip_special_tokens=True, spaces_between_special_tokens=True
+                )
+            recv_obj.prefix_gap_strs_with_before.append(gap_output)
+
+
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
@@ -364,6 +381,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        if len(recv_obj.rids) > 0:
+            self._decode_batch_token_id_diffs(recv_obj)
         if len(output_strs) > 0:
             print(f"[handle_batch_token_id_out] = {output_strs}")
         routed_experts = self._extract_routed_experts(recv_obj)
@@ -405,6 +424,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
             recomputation_rates=recv_obj.recomputation_rates,
+            prefix_gap_strs=recv_obj.prefix_gap_strs,
+            prefix_gap_strs_with_before=recv_obj.prefix_gap_strs_with_before,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

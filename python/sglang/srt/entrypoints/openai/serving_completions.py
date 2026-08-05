@@ -469,6 +469,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 hidden_states=hidden_states,
                 metadata={
                     "recomputation_rate": ret_item["meta_info"]["recomputation_rate"],
+                    "prefix_gap_str": ret_item["meta_info"]["prefix_gap_str"],
+                    "prefix_gap_strs_with_before": ret_item["meta_info"]["prefix_gap_strs_with_before"],
                 }
             )
             choices.append(choice_data)

@@ -1607,6 +1607,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
                 "recomputation_rate": recv_obj.recomputation_rates[i],
+                "prefix_gap_str": recv_obj.prefix_gap_strs[i],
+                "prefix_gap_strs_with_before": recv_obj.prefix_gap_strs_with_before[i],
             }
 
             if self.enable_metrics:

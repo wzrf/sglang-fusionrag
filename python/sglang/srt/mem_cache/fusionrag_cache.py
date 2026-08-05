@@ -243,6 +243,8 @@ class FusionragCache(RadixCache):
         served_model_name = server_args.served_model_name
         if not os.path.exists(cache_path_root):
             cache_path_root = "/mnt/data"
+        if not os.path.exists(cache_path_root):
+            cache_path_root = "/mnt/qjhs-sh-lab-01/eli/"
         self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
         self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":

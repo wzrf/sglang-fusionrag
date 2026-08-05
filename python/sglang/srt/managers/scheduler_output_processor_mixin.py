@@ -906,6 +906,8 @@ class SchedulerOutputProcessorMixin:
         read_offsets = []
         output_ids = []
         recomputation_rates = []
+        prefix_cache_diff_ids = []
+        prefix_cache_diff_ids_with_before = []
 
         skip_special_tokens = []
         spaces_between_special_tokens = []
@@ -1015,6 +1017,8 @@ class SchedulerOutputProcessorMixin:
                 read_offsets.append(read_offset)
                 output_ids.append(output_ids_[send_token_offset:])
                 recomputation_rates.append(req.recomputation_rate)
+                prefix_cache_diff_ids.append(req.prefix_cache_diff_ids)
+                prefix_cache_diff_ids_with_before.append(req.prefix_cache_diff_ids_with_before)
                 req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
@@ -1147,6 +1151,10 @@ class SchedulerOutputProcessorMixin:
                     read_offsets=read_offsets,
                     output_ids=output_ids,
                     recomputation_rates=recomputation_rates,
+                    prefix_gap_ids=prefix_cache_diff_ids,
+                    prefix_gap_ids_with_before=prefix_cache_diff_ids_with_before,
+                    prefix_gap_strs=[],
+                    prefix_gap_strs_with_before=[],
                     skip_special_tokens=skip_special_tokens,
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,

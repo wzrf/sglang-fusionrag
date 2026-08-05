@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 """Request scheduler policy"""
 
 import os
-import random
+import random, copy
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -760,6 +760,7 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                print(f"no token left!!!")
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
@@ -796,7 +797,12 @@ class PrefillAdder:
                                 req.prefix_indices = torch.cat([req.prefix_indices, diff_cache_loc])
                                 print(f"[fusionrag gap] length_diff={length_diff}, diff_cache_loc={diff_cache_loc},"
                                       f"prefix_indices_hicache={len(prefix_indices_hicache)}, prefix_cache_ids={len(req.prefix_cache_ids)}")
-                                # print(f"matched prefix diff={req.prefix_cache_ids[-length_diff-20:]}")
+                                print(f"[fusionrag gap] fill_ids diff={req.fill_ids[len(prefix_indices_hicache): len(req.prefix_cache_ids)]}")
+                                req.prefix_cache_diff_ids = copy.deepcopy(
+                                    req.fill_ids[len(prefix_indices_hicache): len(req.prefix_cache_ids)])
+                                req.prefix_cache_diff_ids_with_before = copy.deepcopy(
+                                    req.fill_ids[len(prefix_indices_hicache) - 10: len(req.prefix_cache_ids)])
+                                print(f"matched prefix prefix_cache_diff_ids={req.prefix_cache_diff_ids[:20]}")
                                 req.recompute_idx[:0] =range(len(prefix_indices_hicache), len(req.prefix_cache_ids))
                                 req.recompute_idx = sorted(set(req.recompute_idx))
                             req.hit_chunk_values = values_list

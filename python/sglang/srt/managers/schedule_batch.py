@@ -537,6 +537,8 @@ class Req(ReqDllmMixin):
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        self.prefix_cache_diff_ids = []
+        self.prefix_cache_diff_ids_with_before = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 

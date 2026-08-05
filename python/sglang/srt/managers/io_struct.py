@@ -1010,6 +1010,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     recomputation_rates: Optional[List[float]] = None
+    prefix_gap_ids: Optional[List[int]] = None
+    prefix_gap_ids_with_before: Optional[List[int]] = None
+    prefix_gap_strs: Optional[List[str]] = None
+    prefix_gap_strs_with_before: Optional[List[str]] = None
 
 
 @dataclass
@@ -1105,6 +1109,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
     recomputation_rates: Optional[List[float]] = None
+    prefix_gap_strs: Optional[List[str]] = None
+    prefix_gap_strs_with_before: Optional[List[str]] = None
 
 
 @dataclass
