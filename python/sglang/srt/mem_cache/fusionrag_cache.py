@@ -138,18 +138,23 @@ class FusionragCache(RadixCache):
         if not server_args.disable_hicache_numa_detect:
             bind_to_closest_numa_node_cuda()
 
-        print(f"FusionragCache tp_rank = {tp_rank}")
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.use_qwen = False
         self.use_deepseek = False
 
+        cache_size = server_args.fusionrag_cache_size
+        if cache_size == 0:
+            cache_size = server_args.hicache_size
+
+        print(f"FusionragCache tp_rank = {tp_rank}, cache_size={cache_size}")
+
         if isinstance(self.kv_cache, MHATokenToKVPool): # QWEN用的是这个？
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
-                server_args.hicache_size,
+                cache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
@@ -159,7 +164,7 @@ class FusionragCache(RadixCache):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
-                server_args.hicache_size,
+                cache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
@@ -245,11 +250,15 @@ class FusionragCache(RadixCache):
             cache_path_root = "/mnt/data"
         if not os.path.exists(cache_path_root):
             cache_path_root = "/mnt/qjhs-sh-lab-01/eli/"
-        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/raw_kv_cache"
-        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache/{served_model_name}/preprocess_kv_cache"
+
+        suffix = ""
+        if tp_size > 0:
+            suffix = f"_{tp_size}"
+        self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache{suffix}/{served_model_name}/raw_kv_cache"
+        self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache{suffix}/{served_model_name}/preprocess_kv_cache"
         if os.environ.get("DEBUG", "0") != "0":
-            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/raw_kv_cache"
-            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG/{served_model_name}/preprocess_kv_cache"
+            self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/raw_kv_cache"
+            self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/preprocess_kv_cache"
         os.makedirs(self.cache_path, exist_ok=True)
         os.makedirs(self.preprocess_cache_path, exist_ok=True)
 
