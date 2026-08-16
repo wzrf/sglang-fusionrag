@@ -252,10 +252,11 @@ class FusionragCache(RadixCache):
             cache_path_root = "/mnt/qjhs-sh-lab-01/eli/"
 
         suffix = ""
-        if tp_size > 0:
+        if tp_size > 1:
             suffix = f"_{tp_size}"
         self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache{suffix}/{served_model_name}/raw_kv_cache"
         self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache{suffix}/{served_model_name}/preprocess_kv_cache"
+        print(f"cache path: {self.cache_path}")
         if os.environ.get("DEBUG", "0") != "0":
             self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/raw_kv_cache"
             self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/preprocess_kv_cache"

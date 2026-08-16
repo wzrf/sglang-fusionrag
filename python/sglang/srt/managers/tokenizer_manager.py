@@ -663,6 +663,67 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         highlighted_with_spaces = "".join(highlighted_tokens[1:])
         print(f"mengyao_debug highlight_recompute_tokens=\n{highlighted_with_spaces}")
 
+    async def _find_recompute_token_in_one_request_from_list(
+        self,
+        recompute_str_list: List[List[str]],
+        is_cross_encoder_request: bool
+    ) -> List[List[int]]:
+        """
+        根据切分并对齐好奇偶协议的 passages 字符串列表 (List[List[str]])，
+        结合全局上下文计算出每个 passage 对应的重算/高亮 Token 绝对索引列表。
+        """
+        # 1. 异步触发外部的高亮渲染/记录逻辑（保持与原逻辑一致）
+        # 如果 self.highlight_recompute_tokens 支持 List[List[str]] 或平铺，可在此处调用
+        # await self.highlight_recompute_tokens(recompute_str_list)
+
+        all_passages_recompute_idx: List[int] = []
+
+        # 维护全局的前缀文本，确保跨 Passage 的 Tokenizer 边界对齐
+        global_prefix_text = ""
+
+        for passage_idx, sub_str_list in enumerate(recompute_str_list):
+            cur_passage_recompute_idx = []
+
+            # 当前 Passage 内部的前缀累加（初始包含全局前缀）
+            cur_texts = global_prefix_text
+
+            for i, recompute_str in enumerate(sub_str_list):
+                cur_texts_ = cur_texts + recompute_str
+
+                # 严格遵循协议：奇数索引为需要重计算/高亮的文本
+                if i % 2 == 1:
+                    # Tokenize 之前的累加前缀
+                    if cur_texts != "":
+                        prefix_prompt_ids, _ = await self._tokenize_texts(
+                            cur_texts, is_cross_encoder_request
+                        )
+                    else:
+                        prefix_prompt_ids = []
+
+                    # Tokenize 包含当前重算片段的新前缀
+                    if cur_texts_ != "":
+                        prefix_prompt_ids_, _ = await self._tokenize_texts(
+                            cur_texts_, is_cross_encoder_request
+                        )
+                    else:
+                        prefix_prompt_ids_ = []
+
+                    # 提取增量 Token 范围（此范围自动包含了全局 Token 的绝对偏移）
+                    cur_passage_recompute_idx.extend(
+                        range(len(prefix_prompt_ids), len(prefix_prompt_ids_))
+                    )
+
+                cur_texts = cur_texts_
+
+            # 排序并去重单个 Passage 内的索引
+            cur_passage_recompute_idx = sorted(set(cur_passage_recompute_idx))
+
+            all_passages_recompute_idx.extend(cur_passage_recompute_idx)
+
+            # 更新全局前缀文本（下一个 Passage 接入时将以此为起点）
+            global_prefix_text = cur_texts
+
+        return all_passages_recompute_idx
 
     async def _find_recompute_token_in_one_request(
         self,
@@ -781,7 +842,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 prefix_cache_ids_len = len(obj.fusionrag_params["prefix_cache_ids"])
 
                 if "recompute_idx" in obj.fusionrag_params:
-                    print(f"recompute_idx in params, recompute_idx={obj.fusionrag_params['recompute_idx']}")
+                    if "recompute_tokens_list" in obj.fusionrag_params:
+                        recompute_idx = await self._find_recompute_token_in_one_request_from_list(
+                            recompute_str_list=obj.fusionrag_params["recompute_tokens_list"],
+                            is_cross_encoder_request=is_cross_encoder_request
+                        )
+                        # print(f"recompute_idx={recompute_idx}")
+                        # assert recompute_idx == obj.fusionrag_params["recompute_idx"]
+
                 elif "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(
                         recompute_str_list=obj.fusionrag_params["recompute_tokens"],
@@ -805,6 +873,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     else:
                         obj.fusionrag_params["recompute_idx"] = [0]
                     print(f"mengyao_debug recompute_idx = {obj.fusionrag_params['recompute_idx']}")
+
+                if 'recompute_idx' in obj.fusionrag_params:
+                    print(f"recompute_idx={obj.fusionrag_params['recompute_idx']}")
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
             if not input_text and self.mm_processor and obj.contains_mm_input():
