@@ -667,63 +667,60 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         recompute_str_list: List[List[str]],
         is_cross_encoder_request: bool
-    ) -> List[List[int]]:
+    ) -> List[int]:
         """
-        根据切分并对齐好奇偶协议的 passages 字符串列表 (List[List[str]])，
-        结合全局上下文计算出每个 passage 对应的重算/高亮 Token 绝对索引列表。
+        根据每个 Passage 独立的 sub_str_list 计算重算的全局 Token 绝对索引。
+        每个 Passage 独立进行 tokenize 差分，再叠加 global_token_offset，
+        彻底避免跨 Passage 文本拼接导致的 BPE 边界错乱。
         """
-        # 1. 异步触发外部的高亮渲染/记录逻辑（保持与原逻辑一致）
-        # 如果 self.highlight_recompute_tokens 支持 List[List[str]] 或平铺，可在此处调用
-        # await self.highlight_recompute_tokens(recompute_str_list)
-
         all_passages_recompute_idx: List[int] = []
-
-        # 维护全局的前缀文本，确保跨 Passage 的 Tokenizer 边界对齐
-        global_prefix_text = ""
+        global_token_offset = 0  # 记录当前 Passage 在全局 Token 序列中的起始偏移量
 
         for passage_idx, sub_str_list in enumerate(recompute_str_list):
             cur_passage_recompute_idx = []
 
-            # 当前 Passage 内部的前缀累加（初始包含全局前缀）
-            cur_texts = global_prefix_text
+            # 1. 仅在当前 Passage 内部累加文本（不带上前面的 Passage 文本）
+            p_cur_texts = ""
 
             for i, recompute_str in enumerate(sub_str_list):
-                cur_texts_ = cur_texts + recompute_str
+                p_cur_texts_ = p_cur_texts + recompute_str
 
                 # 严格遵循协议：奇数索引为需要重计算/高亮的文本
                 if i % 2 == 1:
-                    # Tokenize 之前的累加前缀
-                    if cur_texts != "":
+                    # 仅 Tokenize 当前 Passage 内部的前缀
+                    if p_cur_texts != "":
                         prefix_prompt_ids, _ = await self._tokenize_texts(
-                            cur_texts, is_cross_encoder_request
+                            p_cur_texts, is_cross_encoder_request
                         )
                     else:
                         prefix_prompt_ids = []
 
-                    # Tokenize 包含当前重算片段的新前缀
-                    if cur_texts_ != "":
+                    if p_cur_texts_ != "":
                         prefix_prompt_ids_, _ = await self._tokenize_texts(
-                            cur_texts_, is_cross_encoder_request
+                            p_cur_texts_, is_cross_encoder_request
                         )
                     else:
                         prefix_prompt_ids_ = []
 
-                    # 提取增量 Token 范围（此范围自动包含了全局 Token 的绝对偏移）
-                    cur_passage_recompute_idx.extend(
-                        range(len(prefix_prompt_ids), len(prefix_prompt_ids_))
-                    )
+                    # 2. 算出的局部 Token range 必须加上 global_token_offset 映射回全局绝对索引
+                    local_range = range(len(prefix_prompt_ids), len(prefix_prompt_ids_))
+                    global_range = [idx + global_token_offset for idx in local_range]
+                    cur_passage_recompute_idx.extend(global_range)
 
-                cur_texts = cur_texts_
+                p_cur_texts = p_cur_texts_
+
+            # 3. 计算当前 Passage 整体 Tokenize 后的长度，更新下一个 Passage 的全局偏移量
+            if p_cur_texts != "":
+                p_total_tokens, _ = await self._tokenize_texts(
+                    p_cur_texts, is_cross_encoder_request
+                )
+                global_token_offset += len(p_total_tokens)
 
             # 排序并去重单个 Passage 内的索引
             cur_passage_recompute_idx = sorted(set(cur_passage_recompute_idx))
-
             all_passages_recompute_idx.extend(cur_passage_recompute_idx)
 
-            # 更新全局前缀文本（下一个 Passage 接入时将以此为起点）
-            global_prefix_text = cur_texts
-
-        return all_passages_recompute_idx
+        return sorted(set(all_passages_recompute_idx))
 
     async def _find_recompute_token_in_one_request(
         self,
@@ -847,8 +844,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             recompute_str_list=obj.fusionrag_params["recompute_tokens_list"],
                             is_cross_encoder_request=is_cross_encoder_request
                         )
-                        # print(f"recompute_idx={recompute_idx}")
-                        # assert recompute_idx == obj.fusionrag_params["recompute_idx"]
+                        ##mengyao_debug: just for local debug.
+                        if recompute_idx != obj.fusionrag_params["recompute_idx"]:
+                            print(f"Different! recompute_idx from recompute_tokens_list and recompute_idx.")
+                            print(f"recompute_idx from str={recompute_idx}")
+                            print(f"recompute_idx in the param={obj.fusionrag_params['recompute_idx']}")
+                        else:
+                            print(f"recompute_idx from recompute_tokens_list and recompute_idx are the same!")
+
+                elif "recompute_tokens_list" in obj.fusionrag_params:
+                    recompute_idx = await self._find_recompute_token_in_one_request_from_list(
+                        recompute_str_list=obj.fusionrag_params["recompute_tokens_list"],
+                        is_cross_encoder_request=is_cross_encoder_request
+                    )
+                    obj.fusionrag_params["recompute_idx"] = recompute_idx
 
                 elif "recompute_tokens" in obj.fusionrag_params:
                     recompute_idx = await self._find_recompute_token_in_one_request(
