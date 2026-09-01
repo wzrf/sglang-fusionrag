@@ -1129,6 +1129,8 @@ class Scheduler(
             batch, no_run_list = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            self.process_batch_result_no_run(no_run_list)
+
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
@@ -1136,8 +1138,6 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
-
-            self.process_batch_result_no_run(no_run_list)
 
             # Update last_batch
             self.last_batch = batch
