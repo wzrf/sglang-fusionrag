@@ -260,11 +260,14 @@ class FusionragCache(RadixCache):
         if os.environ.get("DEBUG", "0") != "0":
             self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/raw_kv_cache"
             self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/preprocess_kv_cache"
-        os.makedirs(self.cache_path, exist_ok=True)
-        os.makedirs(self.preprocess_cache_path, exist_ok=True)
+        try:
+            os.makedirs(self.cache_path, exist_ok=True)
+            os.makedirs(self.preprocess_cache_path, exist_ok=True)
+        except Exception as e:
+            print(e)
 
         super().__init__(params=params)
-        self.load_all_from_ssd()
+        # self.load_all_from_ssd()
 
     def list_all_chunk_caches(self, use_preprocess_cache: bool):
         result = []
@@ -843,8 +846,9 @@ class FusionragCache(RadixCache):
             prompt_ids = req.origin_input_ids
             prefix_prompt_ids = req.kv_gen_prefix_len
             prompt_ids_without_prefix = prompt_ids[prefix_prompt_ids:]
-            self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
-                                      prompt_ids_without_prefix)  ## 不存储prefix部分
+            ##mengyao_debug make everything faster.
+            # self._write_cache_to_disk(req, kv_indices[kv_prefix_len:], kv_prefix_len,
+            #                           prompt_ids_without_prefix)  ## 不存储prefix部分
 
             ## mengyao_debug：只需要处理kv gen的情况，其余的情况交给hicache来处理。
             kv_committed_len = req.pop_committed_kv_cache()

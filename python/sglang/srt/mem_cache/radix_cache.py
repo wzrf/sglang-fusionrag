@@ -486,7 +486,7 @@ class RadixCache(BasePrefixCache):
     assert v == x, f"parent does not have child key, {key}"
 AssertionError: parent does not have child key, 7801
         """
-        ## 目前这有bug，测试rag场景的时候需要把is_insert关掉
+        ##mengyao_debug 目前这有bug，测试rag场景的时候需要把insert prefix cache关掉
         is_insert = False
 
         if req.is_kv_gen and req.kv_gen_use_radix_prefix:
