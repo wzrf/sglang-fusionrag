@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -166,7 +166,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
-            print(f"[free] mengyao_debug free_pages= {len(self.free_pages)}")
+            if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                print(f"[free] mengyao_debug free_pages= {len(self.free_pages)}")
         else:
             self.free_group.append(free_index)
 

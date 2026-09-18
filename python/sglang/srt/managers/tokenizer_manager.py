@@ -870,7 +870,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 elif obj.fusionrag_params.get("recompute_debug", False) == True:
                     import random
                     recompute_rate = obj.fusionrag_params.get("recompute_debug_rate", 0.3)
-                    print(f"recompute_debug_rate = {recompute_rate}")
                     length = len(input_ids) - 1
                     if length > 0:
                         recompute_length = int(len(input_ids) * recompute_rate)
@@ -881,10 +880,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         obj.fusionrag_params["recompute_idx"] = numbers
                     else:
                         obj.fusionrag_params["recompute_idx"] = [0]
+                    print(f"recompute_debug_rate = {recompute_rate}")
+                    # if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"mengyao_debug recompute_idx = {obj.fusionrag_params['recompute_idx']}")
 
-                if 'recompute_idx' in obj.fusionrag_params:
-                    print(f"recompute_idx={obj.fusionrag_params['recompute_idx']}")
+                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    if 'recompute_idx' in obj.fusionrag_params:
+                        print(f"recompute_idx={obj.fusionrag_params['recompute_idx']}")
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
             if not input_text and self.mm_processor and obj.contains_mm_input():

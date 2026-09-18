@@ -261,8 +261,9 @@ class FusionragCache(RadixCache):
             self.cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/raw_kv_cache"
             self.preprocess_cache_path = f"{cache_path_root}/xmy/fusionrag_tree_cache_DEBUG{suffix}/{served_model_name}/preprocess_kv_cache"
         try:
-            os.makedirs(self.cache_path, exist_ok=True)
-            os.makedirs(self.preprocess_cache_path, exist_ok=True)
+            ""
+            # os.makedirs(self.cache_path, exist_ok=True)
+            # os.makedirs(self.preprocess_cache_path, exist_ok=True)
         except Exception as e:
             print(e)
 
@@ -577,8 +578,9 @@ class FusionragCache(RadixCache):
         print(f"nodes_to_load len = {len(nodes_to_load)}")
 
         start_time = time.perf_counter()
-        for n in nodes_to_load:
-            print(f"[load_back] text_without_prefix={n.text_without_prefix[:30]}, host_value={n.host_value}")
+        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            for n in nodes_to_load:
+                print(f"[load_back] text_without_prefix={n.text_without_prefix[:30]}, host_value={n.host_value}")
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         last_hit_node = nodes_to_load[-1]
         ancester_node = nodes_to_load[0]
@@ -646,7 +648,8 @@ class FusionragCache(RadixCache):
                     prefix_text = params.key.prefix_prompt_text
                     text_without_prefix = params.key.origin_input_text[len(prefix_text):]
                     if text_without_prefix == node.text_without_prefix:
-                        print(f"kv gen already run before\ntext={text_without_prefix}\n"
+                        if os.environ.get("DEBUG", "0") != "0":
+                            print(f"kv gen already run before\ntext={text_without_prefix}\n"
                               f"prefix={prefix_text}\n"
                               f"is_preprocess_cache={node.is_preprocess_cache}")
                         return MatchResult(
@@ -689,18 +692,19 @@ class FusionragCache(RadixCache):
                             if node.preprocess_cache_key != params.key.preprocess_cache_key_list[match_idx]:
                                 continue
                     if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
-                        print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
-                        print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
-                        print(f"host_value={len(node.host_value)}")
-                        if node.preprocess_cache_key != "":
-                            print(f"match_idx={match_idx} preprocess_cache_key={node.preprocess_cache_key}")
-                        try:
-                            print(f"match_idx={match_idx} prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
-                        except Exception as e:
-                            print(f"match_idx={match_idx}")
-                            print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
+                        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                            print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
+                            print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
+                            print(f"host_value={len(node.host_value)}")
+                            if node.preprocess_cache_key != "":
+                                print(f"match_idx={match_idx} preprocess_cache_key={node.preprocess_cache_key}")
+                            try:
+                                print(f"match_idx={match_idx} prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
+                            except Exception as e:
+                                print(f"match_idx={match_idx}")
+                                print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
                         input_text = input_text[len(node.text_without_prefix) :]
                         last_round_found = True
                         break
@@ -806,12 +810,13 @@ class FusionragCache(RadixCache):
         if req.is_kv_gen and req.save_preprocess_cache:
             print(f"save preprocess cache") ## for debug
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
-        logger.error(
-            f"fusionrag cache_finished_req: rid={req.rid} "
-            f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
-            f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run} "
-            f"preprocess_cache_key={req.preprocess_cache_key}"
-        )
+        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            logger.error(
+                f"fusionrag cache_finished_req: rid={req.rid} "
+                f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
+                f"save_preprocess_cache={req.save_preprocess_cache} no_need_to_run={req.no_need_to_run} "
+                f"preprocess_cache_key={req.preprocess_cache_key}"
+            )
         if req.no_need_to_run:
             return
         if req.is_kv_gen:

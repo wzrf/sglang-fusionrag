@@ -286,9 +286,10 @@ class DeepseekMHAForwardMixin:
                 kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
                 if self.layer_id == 0:
                     # torch.set_printoptions(threshold=10000)
-                    print(f"mengyao_debug kv_indice={kv_indices}, shape={kv_indices.shape}")
-                    print(f"mengyao_debug positions={positions}, shape={positions.shape}")
-                    print(f"mengyao_debug out_cache_loc={forward_batch.out_cache_loc}, shape={forward_batch.out_cache_loc.shape}")
+                    if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                        print(f"mengyao_debug kv_indice={kv_indices}, shape={kv_indices.shape}")
+                        print(f"mengyao_debug positions={positions}, shape={positions.shape}")
+                        print(f"mengyao_debug out_cache_loc={forward_batch.out_cache_loc}, shape={forward_batch.out_cache_loc.shape}")
                     # torch.set_printoptions(threshold=1000)
                     if has_duplicates(kv_indices):
                         # torch.set_printoptions(threshold=10000)
@@ -470,7 +471,7 @@ class DeepseekMHAForwardMixin:
             # q1 = copy.deepcopy(q)
             # k1 = copy.deepcopy(k)
             # v1 = copy.deepcopy(v)
-            if self.layer_id == 0:
+            if self.layer_id == 0 and self.o_proj.tp_rank == 0:
                 print(f"mengyap_debug forward_normal_core_fusionrag q={q.shape}, k={k.shape}, v={v.shape}")
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False, layer_id =self.layer_id)
             # attn_output = self.forward_normal_core_fusionrag(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), forward_batch, self.attn_mha.scaling).to(q.dtype)

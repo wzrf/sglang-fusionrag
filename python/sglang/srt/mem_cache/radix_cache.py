@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
-
+import os
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -501,15 +501,16 @@ AssertionError: parent does not have child key, 7801
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        print(f"[cache_finished_req] kv_committed_len={kv_committed_len}")
-        print(f"[cache_finished_req] req.origin_input_ids={len(req.origin_input_ids)}")
-        print(f"[cache_finished_req] req.output_ids={len(req.output_ids)}")
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
-        print(f"[cache_finished_req] kv_indices={kv_indices}")
+        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            print(f"[cache_finished_req] kv_committed_len={kv_committed_len}")
+            print(f"[cache_finished_req] req.origin_input_ids={len(req.origin_input_ids)}")
+            print(f"[cache_finished_req] req.output_ids={len(req.output_ids)}")
+            print(f"[cache_finished_req] kv_indices={kv_indices}")
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -517,8 +518,9 @@ AssertionError: parent does not have child key, 7801
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle, origin_input_text=req.origin_input_text)
 
-        print(f"[cache_finished_req] keys={len(keys)} ")
-        print(f"[cache_finished_req] req.cache_protected_len={req.cache_protected_len}")
+        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            print(f"[cache_finished_req] keys={len(keys)} ")
+            print(f"[cache_finished_req] req.cache_protected_len={req.cache_protected_len}")
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -529,10 +531,11 @@ AssertionError: parent does not have child key, 7801
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
             ## mengyao_debug cache_protected_len之前是推理之前前缀匹配出来的，cache_protected_len 到 new_prefix_len是decode出来但是已经在prefix cache里面的；
-            print(f"[cache_finished_req] new_prefix_len={new_prefix_len}")
-            print(f"[cache_finished_req] new insert ids 1 = {req.fill_ids[req.cache_protected_len : new_prefix_len]}")
-            print(f"[cache_finished_req] new insert origin_input_ids = {req.origin_input_ids[req.cache_protected_len:]}")
-            print(f"[cache_finished_req] new insert output_ids = {req.output_ids}")
+            if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                print(f"[cache_finished_req] new_prefix_len={new_prefix_len}")
+                print(f"[cache_finished_req] new insert ids 1 = {req.fill_ids[req.cache_protected_len : new_prefix_len]}")
+                print(f"[cache_finished_req] new insert origin_input_ids = {req.origin_input_ids[req.cache_protected_len:]}")
+                print(f"[cache_finished_req] new insert output_ids = {req.output_ids}")
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )

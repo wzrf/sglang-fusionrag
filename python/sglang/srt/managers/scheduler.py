@@ -1212,6 +1212,7 @@ class Scheduler(
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
+        print(f"is_disable_overlap_for_batch batch={batch} disable_overlap_for_batch={disable_overlap_for_batch}")
         need_grammar_sync = (
             batch
             and batch.is_spec_v2
@@ -1650,7 +1651,8 @@ class Scheduler(
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-                print(f"{req.rid} is prefill only, logprob_start_len={req.logprob_start_len}")
+                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    print(f"{req.rid} is prefill only, logprob_start_len={req.logprob_start_len}")
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1

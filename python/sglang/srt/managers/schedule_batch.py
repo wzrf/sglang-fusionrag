@@ -39,6 +39,7 @@ import copy
 import dataclasses
 import logging
 import re
+import os
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -47,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+import time
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
@@ -532,7 +534,9 @@ class Req(ReqDllmMixin):
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-        print(f"origin_input_ids={len(origin_input_ids)}")
+
+        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            print(f"origin_input_ids={len(origin_input_ids)}")
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -1003,7 +1007,8 @@ class Req(ReqDllmMixin):
             self.host_hit_length = match_result.host_hit_length
             self.prefix_indices = match_result.device_indices  ## empty
             if match_result.no_need_to_run:
-                print(f"req doesn't need to be run.")
+                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    print(f"req doesn't need to be run.")
                 self.no_need_to_run = True
         else:
             # if len(self.prefix_cache_ids) >= 0:
@@ -1042,6 +1047,7 @@ class Req(ReqDllmMixin):
             print(f"[hiradix cache] req prefix_indices_hicache length = {len(self.prefix_indices_hicache)}, host_hit_length_hicache={self.host_hit_length_hicache}")
             self.cache_protected_len = len(self.prefix_indices_hicache)
 
+            time_start = time.time()
             match_result_fusionrag = tree_cache_fusionrag.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids,
@@ -1060,6 +1066,7 @@ class Req(ReqDllmMixin):
                     cow_mamba=tree_cache_hicache.supports_mamba(),
                 ),
             )
+            print(f"tree_cache_fusionrag match prefix takes {time.time() - time_start}")
 
             self.hit_chunk_nodes = match_result_fusionrag.all_hit_chunk_nodes
             self.host_hit_length_fusionrag = match_result_fusionrag.host_hit_length
@@ -1616,7 +1623,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
-            print(f"r.prefix_indices len = {len(r.prefix_indices)}\n r.fill_ids len = {len(r.fill_ids)}")
+            if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                print(f"r.prefix_indices len = {len(r.prefix_indices)}\n r.fill_ids len = {len(r.fill_ids)}")
             r.all_compute_idx.extend(extend_compute_idx)
             ## mengyao_debug: just in case it overlaps
             r.all_compute_idx = sorted(set(r.all_compute_idx))
@@ -1626,17 +1634,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a DECODER TASK")
             if r.host_hit_length_fusionrag >0:
                 r.recomputation_rate = len(r.recompute_idx) / r.host_hit_length_fusionrag
-                print(f"mengyao_debug recompute percentage="
-                      f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
-                # torch.set_printoptions(threshold=10000)
-                print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
-                print(f"mengyao_debug recompute_idx_origin={r.recompute_idx_origin}")
-                print(f"mengyao_debug recompute_idx={r.recompute_idx}")
-                # torch.set_printoptions(threshold=1000)
+                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    print(f"mengyao_debug recompute percentage="
+                          f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
+                    # torch.set_printoptions(threshold=10000)
+                    print(f"mengyao_debug host_hit_length_fusionrag={r.host_hit_length_fusionrag}")
+                    print(f"mengyao_debug recompute_idx_origin={r.recompute_idx_origin}")
+                    print(f"mengyao_debug recompute_idx={r.recompute_idx}")
+                    # torch.set_printoptions(threshold=1000)
             else:
                 r.recomputation_rate = 1
                 print(f"mengyao_debug compute percentage=100%")
-            print(f"r.all_compute_idx = {r.all_compute_idx}")
+            if os.environ.get("DEBUG", "0") != "0":
+                print(f"r.all_compute_idx = {r.all_compute_idx}")
             print(f"r.fill_ids = {len(r.fill_ids)}")
             # print(f"r.fill_ids recompute = {[r.fill_ids[i] for i in r.all_compute_idx]}")
             input_id = [r.fill_ids[i] for i in r.all_compute_idx]
@@ -1788,10 +1798,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                print(f"req.origin_input_ids={len(req.origin_input_ids)}")
-                print(f"req.logprob_start_len={req.logprob_start_len}")
-                print(f"req.fill_ids={len(req.fill_ids)}")
-                print(f"req.prefix_indices={len(req.prefix_indices)}")
+                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    print(f"req.origin_input_ids={len(req.origin_input_ids)}")
+                    print(f"req.logprob_start_len={req.logprob_start_len}")
+                    print(f"req.fill_ids={len(req.fill_ids)}")
+                    print(f"req.prefix_indices={len(req.prefix_indices)}")
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
@@ -2110,7 +2121,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache_hicache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache_hicache, num_tokens)

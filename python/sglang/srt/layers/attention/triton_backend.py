@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
-
+import time
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -396,7 +396,9 @@ class TritonAttnBackend(AttentionBackend):
             )
             ## let's build the custom_mask
             ## todo@mengyao_debug 这种情况完全不考虑prefix match。
+            time_start = time.time()
             mask_indptr, custom_mask = make_custom_casual_mask(forward_batch)
+            print(f"make custom mask time: {time.time() - time_start}")
 
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
