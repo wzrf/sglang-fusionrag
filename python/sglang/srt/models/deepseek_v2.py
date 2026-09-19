@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -2636,7 +2637,7 @@ class DeepseekV2Model(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
-        if os.environ.get("DEBUG", "0") == "1":
+        if os.environ.get("DEBUG_LAYER", "0") == "1":
             config.num_hidden_layers = 3
         print(f"[DeepseekV2Model] num_hidden_layers={config.num_hidden_layers}")
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -2828,7 +2829,8 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = []
 
         # FusionRAG: 尝试修复命中的块缓存中的 RoPE 旋转
-        self.fix_rope_test(forward_batch)
+
+        self.fix_rope_test(forward_batch) ##fixme: add this back
 
         origin_positions = None
         # if forward_batch.forward_mode == ForwardMode.EXTEND and\
@@ -2853,6 +2855,7 @@ class DeepseekV2Model(nn.Module):
         #     hidden_states = hidden_states[positions]
 
 
+        time_start = time.time()
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2927,6 +2930,8 @@ class DeepseekV2Model(nn.Module):
                 torch.cuda.current_stream(),
             )
 
+        if self.pp_group.is_last_rank:
+            print(f"Deepseek model forward takes {time.time() - time_start} seconds.")
         # self.fix_rope_test_after_preprocess(forward_batch)
         if len(aux_hidden_states) == 0:
             return hidden_states

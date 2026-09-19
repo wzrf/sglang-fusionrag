@@ -462,7 +462,7 @@ class FusionragCache(RadixCache):
             node_id=node.id,
         )
         if host_indices is None:
-            self.evict_host(len(node.values))
+            self.evict_host(len(node.values[0]))
             host_indices = self.cache_controller.write(
                 device_indices=node.values[0],
                 node_id=node.id,
@@ -566,8 +566,29 @@ class FusionragCache(RadixCache):
 
     def evict_host(self, num_tokens: int):
         """
-        we skip this for now
+        Evict host cache nodes with host_ref_counter == 0,
+        preferring nodes with the lowest hit_count.
         """
+        tokens_freed = 0
+
+        # 只选择可以被 eviction 的 node，并按照 hit_count 从小到大排序
+        evictable_nodes = [
+            node for node in self.all_nodes
+            if node.host_ref_counter == 0 and node.host_value is not None
+        ]
+        evictable_nodes.sort(key=lambda node: node.hit_count)
+
+        for node in evictable_nodes:
+            if tokens_freed >= num_tokens:
+                break
+
+            self.cache_controller.mem_pool_host.free(node.host_value)
+            tokens_freed += len(node.host_value)
+
+            # 从 all_nodes 中移除
+            self.all_nodes.remove(node)
+
+        return tokens_freed
 
 
     def load_back(
@@ -691,9 +712,11 @@ class FusionragCache(RadixCache):
                         if preprocess_cache_key_list is not None and preprocess_cache_key_list[match_idx] != "skip":
                             if node.preprocess_cache_key != params.key.preprocess_cache_key_list[match_idx]:
                                 continue
-                    if len(node.text_without_prefix) > 20 and input_text.startswith(node.text_without_prefix):
+                    if len(node.text_without_prefix) > 5 and input_text.startswith(node.text_without_prefix):
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
+                        node.host_ref_counter += 1
+                        node.hit_count += 1
                         if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
                             print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                             print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
@@ -868,6 +891,7 @@ class FusionragCache(RadixCache):
 
         for node_idx, node in enumerate(req.hit_chunk_nodes):
             value_to_remove = req.hit_chunk_values[node_idx].value
+            node.host_ref_counter -= 1
             try:
                 for value_idx, value in enumerate(node.values):
                     if torch.equal(value, value_to_remove):  # 比较内容是否完全一致
