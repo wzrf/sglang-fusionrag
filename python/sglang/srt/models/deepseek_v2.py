@@ -27,6 +27,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+import triton
+import triton.language as tl
 from transformers import PretrainedConfig
 # Added for FusionRAG: 增加工具库用于缓存文件的 md5 计算、元数据存储及深拷贝
 import hashlib, json, copy
@@ -2830,7 +2832,8 @@ class DeepseekV2Model(nn.Module):
 
         # FusionRAG: 尝试修复命中的块缓存中的 RoPE 旋转
 
-        self.fix_rope_test(forward_batch) ##fixme: add this back
+        # self.fix_rope_test(forward_batch)
+        self.fix_rope_test_triton(forward_batch) ##fixme: add this back
 
         origin_positions = None
         # if forward_batch.forward_mode == ForwardMode.EXTEND and\
@@ -3095,6 +3098,78 @@ class DeepseekV2Model(nn.Module):
                             k,
                             k_rope,
                         )
+
+    def fix_rope_test_triton(self, forward_batch):
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+
+        # 1. 收集所有 Request 命中的 Chunk
+        all_device_indices = []
+        all_wrong_positions = []
+        all_correct_positions = []
+
+        for req in forward_batch.reqs:
+            if not req.hit_chunk_values:
+                continue
+
+            for hit_chunk_node in req.hit_chunk_values:
+                all_device_indices.append(
+                    hit_chunk_node.value
+                )
+                all_wrong_positions.append(
+                    hit_chunk_node.original_position
+                )
+                all_correct_positions.append(
+                    hit_chunk_node.current_position
+                )
+
+        if not all_device_indices:
+            return
+
+        # 2. 合并所有 Chunk 的索引和位置
+        device_indices = torch.cat(
+            all_device_indices
+        ).to(device="cuda", dtype=torch.int64).contiguous()
+
+        wrong_positions = torch.cat(
+            all_wrong_positions
+        ).to(device="cuda", dtype=torch.int32).contiguous()
+
+        correct_positions = torch.cat(
+            all_correct_positions
+        ).to(device="cuda", dtype=torch.int32).contiguous()
+
+        # 3. 每个 Layer 只调用一次 Triton Kernel
+        for layer_id, layer in enumerate(self.layers):
+            # 获取整个 Layer 的 KV Cache
+            kv_buffer = (
+                forward_batch.token_to_kv_pool
+                .get_key_buffer(layer_id)
+            )
+
+            rotary_cache = (
+                layer.self_attn.rotary_emb.cos_sin_cache
+            )
+
+            # 原地修正所有命中 Chunk 的 RoPE
+            correct_rope_chunks_triton(
+                kv_buffer=kv_buffer,
+                rotary_cache=rotary_cache,
+                device_indices=device_indices,
+                wrong_positions=wrong_positions,
+                correct_positions=correct_positions,
+                rope_dim=64,
+            )
+
+        print(
+            f"[fix_rope_test] Fixed RoPE: "
+            f"{len(all_device_indices)} chunks, "
+            f"{device_indices.numel()} tokens, "
+            f"{len(self.layers)} layers"
+        )
 
     def find_recompute_idx(
         self,
@@ -3529,9 +3604,6 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
     k_odd = k_reshaped[..., 1]
 
     # 6. 应用修正旋转：用Δθ旋转当前向量
-    # x_correct = x_wrong * cos(Δθ) - y_wrong * sin(Δθ)
-    # y_correct = x_wrong * sin(Δθ) + y_wrong * cos(Δθ)
-
     k_correct_even = k_even * cos_delta - k_odd * sin_delta
     k_correct_odd = k_even * sin_delta + k_odd * cos_delta
 
@@ -3540,6 +3612,135 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype)
 
+@triton.jit
+def _correct_rope_chunks_kernel(
+    KV,
+    RotaryCache,
+    DeviceIndices,
+    WrongPositions,
+    CorrectPositions,
+    H: tl.constexpr,
+    KV_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    KV_STRIDE_0: tl.constexpr,
+    KV_STRIDE_1: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # 一个 program 处理一个 token
+    token_id = tl.program_id(0)
+
+    half_dim: tl.constexpr = ROPE_DIM // 2
+
+    # KV Cache 中的真实槽位
+    device_idx = tl.load(DeviceIndices + token_id)
+
+    wrong_pos = tl.load(WrongPositions + token_id)
+    correct_pos = tl.load(CorrectPositions + token_id)
+
+    idx = tl.arange(0, BLOCK)
+    mask = idx < H * half_dim
+
+    head_id = idx // half_dim
+    pair_id = idx % half_dim
+
+    # RoPE cache
+    wrong_base = RotaryCache + wrong_pos * CACHE_STRIDE
+    correct_base = RotaryCache + correct_pos * CACHE_STRIDE
+
+    cw = tl.load(
+        wrong_base + pair_id, mask, other=1
+    ).to(tl.float32)
+
+    sw = tl.load(
+        wrong_base + half_dim + pair_id, mask, other=0
+    ).to(tl.float32)
+
+    cc = tl.load(
+        correct_base + pair_id, mask, other=1
+    ).to(tl.float32)
+
+    sc = tl.load(
+        correct_base + half_dim + pair_id, mask, other=0
+    ).to(tl.float32)
+
+    cos_delta = cc * cw + sc * sw
+    sin_delta = sc * cw - cc * sw
+
+    # 直接定位 KV Cache 的 RoPE 部分
+    # [pool_size, H, KV_DIM]
+    # 前 KV_DIM - ROPE_DIM 维不修改
+    kv_offset = (
+        device_idx * KV_STRIDE_0
+        + head_id * KV_STRIDE_1
+        + (KV_DIM - ROPE_DIM)
+        + pair_id * 2
+    )
+
+    k_even = tl.load(
+        KV + kv_offset, mask, other=0
+    ).to(tl.float32)
+
+    k_odd = tl.load(
+        KV + kv_offset + 1, mask, other=0
+    ).to(tl.float32)
+
+    out_even = k_even * cos_delta - k_odd * sin_delta
+    out_odd = k_even * sin_delta + k_odd * cos_delta
+
+    tl.store(KV + kv_offset, out_even, mask)
+    tl.store(KV + kv_offset + 1, out_odd, mask)
+
+
+def correct_rope_chunks_triton(
+    kv_buffer,
+    rotary_cache,
+    device_indices,
+    wrong_positions,
+    correct_positions,
+    rope_dim=64,
+):
+    assert kv_buffer.is_cuda
+    assert kv_buffer.ndim == 3
+    assert rope_dim % 2 == 0
+    assert kv_buffer.shape[-1] >= rope_dim
+    assert kv_buffer.stride(-1) == 1
+    assert rotary_cache.is_contiguous()
+
+    assert device_indices.is_contiguous()
+    assert wrong_positions.is_contiguous()
+    assert correct_positions.is_contiguous()
+
+    total_tokens = device_indices.numel()
+
+    if total_tokens == 0:
+        return kv_buffer
+
+    num_heads = kv_buffer.shape[1]
+    kv_dim = kv_buffer.shape[2]
+
+    block = triton.next_power_of_2(
+        num_heads * (rope_dim // 2)
+    )
+
+    _correct_rope_chunks_kernel[(total_tokens,)](
+        kv_buffer,
+        rotary_cache,
+        device_indices,
+        wrong_positions,
+        correct_positions,
+        num_heads,
+        kv_dim,
+        rope_dim,
+        kv_buffer.stride(0),
+        kv_buffer.stride(1),
+        rotary_cache.stride(0),
+        block,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+    return kv_buffer
 
 def is_extend_and_debug(forward_batch: ForwardBatch) -> bool:
     return False

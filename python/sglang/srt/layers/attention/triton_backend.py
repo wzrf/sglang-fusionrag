@@ -397,7 +397,8 @@ class TritonAttnBackend(AttentionBackend):
             ## let's build the custom_mask
             ## todo@mengyao_debug 这种情况完全不考虑prefix match。
             time_start = time.time()
-            mask_indptr, custom_mask = make_custom_casual_mask(forward_batch)
+            # mask_indptr, custom_mask = make_custom_casual_mask(forward_batch)
+            mask_indptr, custom_mask = None, None
             print(f"make custom mask time: {time.time() - time_start}")
 
             create_flashinfer_kv_indices_triton[(bs,)](
@@ -878,6 +879,7 @@ class TritonAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
+            forward_batch.positions.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),

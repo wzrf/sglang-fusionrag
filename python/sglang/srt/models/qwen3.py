@@ -5,7 +5,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
-
+import torch
+import numpy as np
+import triton
+import triton.language as tl
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -445,7 +448,8 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        self.fix_rope_test(forward_batch)
+        # self.fix_rope_test(forward_batch)
+        self.fix_rope_test_triton(forward_batch)
         hidden_states = self.model(
             input_ids,
             positions,
@@ -661,6 +665,105 @@ class Qwen3ForCausalLM(nn.Module):
                         )
         forward_batch.rope_fixed = True
 
+    @torch.no_grad()
+    def fix_rope_test_triton(self, forward_batch):
+        if forward_batch is None or forward_batch.reqs is None:
+            return
+
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return
+
+        if forward_batch.rope_fixed:
+            return
+
+        all_device_indices = []
+        all_wrong_positions = []
+        all_correct_positions = []
+
+        # 1. 收集所有 Request 的 Chunk
+        for req in forward_batch.reqs:
+            if req.is_kv_gen:
+                continue
+
+            if not req.hit_chunk_values:
+                continue
+
+            for hit_chunk_node in req.hit_chunk_values:
+                all_device_indices.append(hit_chunk_node.value)
+                all_wrong_positions.append(hit_chunk_node.original_position)
+                all_correct_positions.append(hit_chunk_node.current_position)
+
+        if not all_device_indices:
+            forward_batch.rope_fixed = True
+            return
+
+        # 2. 使用 KV Cache 所在的 GPU
+        first_kv, _ = forward_batch.token_to_kv_pool.get_kv_buffer(
+            self.model.start_layer
+        )
+        device = first_kv.device
+
+        device_indices = torch.cat([
+            torch.as_tensor(x, device=device, dtype=torch.int64).reshape(-1)
+            for x in all_device_indices
+        ]).contiguous()
+
+        wrong_positions = torch.cat([
+            torch.as_tensor(x, device=device, dtype=torch.int32).reshape(-1)
+            for x in all_wrong_positions
+        ]).contiguous()
+
+        correct_positions = torch.cat([
+            torch.as_tensor(x, device=device, dtype=torch.int32).reshape(-1)
+            for x in all_correct_positions
+        ]).contiguous()
+
+        assert (
+            device_indices.numel()
+            == wrong_positions.numel()
+            == correct_positions.numel()
+        )
+
+        # 调试阶段检查重复 KV 槽位
+        assert (
+            torch.unique(device_indices).numel()
+            == device_indices.numel()
+        ), "Duplicate KV cache indices detected!"
+
+        # 3. 每个 Layer 调用一次 Triton Kernel
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
+
+            k_buffer, _ = (
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+            )
+
+            rotary_cache = layer.self_attn.rotary_emb.cos_sin_cache
+
+            rope_dim = layer.self_attn.head_dim
+
+            assert k_buffer.shape[-1] == rope_dim
+
+            correct_rope_chunks_neox_triton(
+                kv_buffer=k_buffer,
+                rotary_cache=rotary_cache,
+                device_indices=device_indices,
+                wrong_positions=wrong_positions,
+                correct_positions=correct_positions,
+                rope_dim=rope_dim,
+            )
+
+        # 4. 所有 Layer 修正完成
+        forward_batch.rope_fixed = True
+
+        print(
+            f"[Qwen3 fix_rope] "
+            f"chunks={len(all_device_indices)}, "
+            f"tokens={device_indices.numel()}, "
+            f"layers={self.model.end_layer - self.model.start_layer}"
+        )
+
+
 def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positions):
     """
     修正错误的RoPE旋转
@@ -701,8 +804,6 @@ def correct_rope_rotation(k_wrong, rotary_cache, wrong_positions, correct_positi
 
     return k_correct.view(seq_len, num_heads_k, head_dim).to(k_wrong.dtype).contiguous()
 
-import torch
-import numpy as np
 
 def compare_relative_difference_torch(a, b, mode='b', eps=1e-8):
     a = a.detach().float()
@@ -733,5 +834,218 @@ def compare_relative_difference_torch(a, b, mode='b', eps=1e-8):
         'max_value_b': b.flatten()[idx_flat].item(),
         'mean_rel_diff': mean_val.item()
     }
+
+
+@triton.jit
+def _correct_rope_chunks_neox_kernel(
+    KV,
+    RotaryCache,
+    DeviceIndices,
+    WrongPositions,
+    CorrectPositions,
+    H: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    KV_STRIDE_0: tl.constexpr,
+    KV_STRIDE_1: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # 一个 Triton Program 处理一个 token
+    token_id = tl.program_id(0)
+
+    half_dim: tl.constexpr = ROPE_DIM // 2
+
+    # KV Cache 中的真实槽位
+    device_idx = tl.load(DeviceIndices + token_id)
+
+    # 原始位置和目标位置
+    wrong_pos = tl.load(WrongPositions + token_id)
+    correct_pos = tl.load(CorrectPositions + token_id)
+
+    # 并行处理所有 KV heads 和 rotary pairs
+    idx = tl.arange(0, BLOCK)
+    mask = idx < H * half_dim
+
+    head_id = idx // half_dim
+    pair_id = idx % half_dim
+
+    # 读取原始位置的 cos/sin
+    wrong_base = RotaryCache + wrong_pos * CACHE_STRIDE
+
+    cw = tl.load(
+        wrong_base + pair_id,
+        mask,
+        other=1,
+    ).to(tl.float32)
+
+    sw = tl.load(
+        wrong_base + half_dim + pair_id,
+        mask,
+        other=0,
+    ).to(tl.float32)
+
+    # 读取目标位置的 cos/sin
+    correct_base = RotaryCache + correct_pos * CACHE_STRIDE
+
+    cc = tl.load(
+        correct_base + pair_id,
+        mask,
+        other=1,
+    ).to(tl.float32)
+
+    sc = tl.load(
+        correct_base + half_dim + pair_id,
+        mask,
+        other=0,
+    ).to(tl.float32)
+
+    # 计算相对旋转角度
+    cos_delta = cc * cw + sc * sw
+    sin_delta = sc * cw - cc * sw
+
+    # NeoX RoPE:
+    # 前半维度与后半维度配对
+    #
+    # [0, 1, ..., half_dim-1]
+    # [half_dim, ..., ROPE_DIM-1]
+
+    kv_offset = (
+        device_idx * KV_STRIDE_0
+        + head_id * KV_STRIDE_1
+        + pair_id
+    )
+
+    k_even = tl.load(
+        KV + kv_offset,
+        mask,
+        other=0,
+    ).to(tl.float32)
+
+    k_odd = tl.load(
+        KV + kv_offset + half_dim,
+        mask,
+        other=0,
+    ).to(tl.float32)
+
+    # 应用旋转修正
+    out_even = (
+        k_even * cos_delta
+        - k_odd * sin_delta
+    )
+
+    out_odd = (
+        k_even * sin_delta
+        + k_odd * cos_delta
+    )
+
+    # 原地写回 K Cache
+    tl.store(
+        KV + kv_offset,
+        out_even,
+        mask,
+    )
+
+    tl.store(
+        KV + kv_offset + half_dim,
+        out_odd,
+        mask,
+    )
+
+
+def correct_rope_chunks_neox_triton(
+    kv_buffer,
+    rotary_cache,
+    device_indices,
+    wrong_positions,
+    correct_positions,
+    rope_dim=None,
+):
+    """
+    合并多个 Chunk，使用一次 Triton Kernel
+    原地修正 Qwen3 K Cache 的 NeoX RoPE。
+
+    Args:
+        kv_buffer:
+            [pool_size, num_kv_heads, head_dim]
+            原始 KV Cache 中的 K Tensor。
+
+        rotary_cache:
+            [max_position, rope_dim]
+            前半部分为 cos，后半部分为 sin。
+
+        device_indices:
+            [total_tokens]
+            合并后的 KV Cache 槽位索引。
+
+        wrong_positions:
+            [total_tokens]
+            K 原来使用的 RoPE position。
+
+        correct_positions:
+            [total_tokens]
+            K 应当使用的 RoPE position。
+
+        rope_dim:
+            RoPE 旋转维度，默认等于 head_dim。
+
+    Returns:
+        kv_buffer:
+            原地修改后的 K Cache。
+    """
+
+    assert kv_buffer.is_cuda
+    assert kv_buffer.ndim == 3
+    assert kv_buffer.stride(-1) == 1
+
+    assert rotary_cache.is_cuda
+    assert rotary_cache.is_contiguous()
+
+    assert device_indices.is_cuda
+    assert wrong_positions.is_cuda
+    assert correct_positions.is_cuda
+
+    assert device_indices.is_contiguous()
+    assert wrong_positions.is_contiguous()
+    assert correct_positions.is_contiguous()
+
+    pool_size, num_heads, head_dim = kv_buffer.shape
+
+    if rope_dim is None:
+        rope_dim = head_dim
+
+    assert rope_dim == head_dim
+    assert rope_dim % 2 == 0
+    assert rotary_cache.shape[1] == rope_dim
+
+    total_tokens = device_indices.numel()
+
+    assert wrong_positions.numel() == total_tokens
+    assert correct_positions.numel() == total_tokens
+
+    if total_tokens == 0:
+        return kv_buffer
+
+    block = triton.next_power_of_2(
+        num_heads * (rope_dim // 2)
+    )
+
+    _correct_rope_chunks_neox_kernel[(total_tokens,)](
+        kv_buffer,
+        rotary_cache,
+        device_indices,
+        wrong_positions,
+        correct_positions,
+        num_heads,
+        rope_dim,
+        kv_buffer.stride(0),
+        kv_buffer.stride(1),
+        rotary_cache.stride(0),
+        block,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+    return kv_buffer
+
 
 EntryClass = Qwen3ForCausalLM

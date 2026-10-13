@@ -221,6 +221,7 @@ def _fwd_kernel_fusionrag(
     K_Extend,
     V_Extend,
     O_Extend,
+    Q_Positions,
     K_Buffer,
     V_Buffer,
     qo_indptr,
@@ -275,7 +276,7 @@ def _fwd_kernel_fusionrag(
     # cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
     # cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
 
-    cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+    # cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)  ##fixme: 128,BLOCK_DMODEL 每个head有多少维度？
     offs_dv = tl.arange(0, BLOCK_DV)  ##fixme: 128,BLOCK_DV=value维度是多少
@@ -296,6 +297,13 @@ def _fwd_kernel_fusionrag(
         Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
     )
 
+    q_idx = cur_block_m * BLOCK_M + offs_m
+    q_pos = tl.load(
+        Q_Positions + cur_seq_q_extend_start_idx + q_idx,
+        mask=mask_m,
+        other=-1,
+    )
+
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
@@ -314,7 +322,19 @@ def _fwd_kernel_fusionrag(
 
     # stage 2: compute the triangle part
     ##mengyao_debug: 需要计算完整序列
-    cur_block_m_end = cur_seq_k_len_extend
+    # cur_block_m_end = cur_seq_k_len_extend
+
+    ##mengyao_debug 找到 q最大的位置
+    max_q_pos = tl.max(
+        tl.where(mask_m, q_pos, -1),
+        axis=0,
+    )
+
+    # 只计算到最大 Query 位置所对应的 Key Block
+    cur_block_m_end = tl.minimum(
+        cur_seq_k_len_extend,
+        max_q_pos + 1,
+    )
 
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -322,21 +342,26 @@ def _fwd_kernel_fusionrag(
 
         final_mask = mask_m[:, None] & mask_n[None, :]
 
-        custom_mask = tl.load(
-            mask_ptr
-            + cur_seq_mask_start_idx
-            + (cur_block_m * BLOCK_M + offs_m[:, None])
-            * (cur_seq_k_len_extend)
-            + start_n
-            + offs_n[None, :],
-            mask=(mask_m[:, None] & mask_n[None, :]),
-            other=0,
-        )
-        # if cur_seq == 1 and cur_head == 0:
-        #     tl.device_print("custom_mask", custom_mask)
+        # custom_mask = tl.load(
+        #     mask_ptr
+        #     + cur_seq_mask_start_idx
+        #     + (cur_block_m * BLOCK_M + offs_m[:, None])
+        #     * (cur_seq_k_len_extend)
+        #     + start_n
+        #     + offs_n[None, :],
+        #     mask=(mask_m[:, None] & mask_n[None, :]),
+        #     other=0,
+        # )
 
-        custom_mask &= mask_m[:, None] & mask_n[None, :]
-        final_mask &= custom_mask
+        mask_causal = (
+            q_pos[:, None]
+            >=
+            (start_n + offs_n[None, :])
+        )
+
+
+        # custom_mask &= mask_m[:, None] & mask_n[None, :]
+        final_mask &= mask_causal
 
         ## k的加载方式需要修改，需要把这一整条给load出来
         offs_k = (
@@ -759,6 +784,7 @@ def extend_attention_fwd(
     q_extend,
     k_extend,
     v_extend,
+    q_positions,
     o_extend,
     k_buffer,
     v_buffer,
@@ -828,6 +854,7 @@ def extend_attention_fwd(
             k_extend,
             v_extend,
             o_extend,
+            q_positions,
             k_buffer,
             v_buffer,
             qo_indptr,
