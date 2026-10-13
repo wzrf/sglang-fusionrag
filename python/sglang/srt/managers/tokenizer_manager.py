@@ -802,9 +802,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prompt_ids_list"] = prompt_ids_list
                     ## 重新赋值input_ids
                     input_ids = [num for sublist in prompt_ids_list for num in sublist]
-                    print(f"tokenize one request mengyao_debug input_ids={len(input_ids)}")
+                    if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                        print(f"tokenize one request mengyao_debug input_ids={len(input_ids)}")
                 else:
-                    print(f"mengyao_debug prompt_list should be in params.")
+                    if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                        print(f"mengyao_debug prompt_list should be in params.")
 
                 if "prefix_prompt_list" in obj.fusionrag_params:
                     prefix_prompt_list = obj.fusionrag_params["prefix_prompt_list"]
@@ -817,9 +819,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     obj.fusionrag_params["prefix_prompt_ids_list"] = prefix_prompt_ids_list
                     prefix_prompt_ids = [num for sublist in prefix_prompt_ids_list for num in sublist]
                     obj.fusionrag_params["prefix_prompt_ids"] = prefix_prompt_ids
-                    print(f"tokenize one request mengyao_debug prefix_prompt_ids={len(prefix_prompt_ids)}")
+                    if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                        print(f"tokenize one request mengyao_debug prefix_prompt_ids={len(prefix_prompt_ids)}")
                 else:
-                    print(f"mengyao_debug prefix_prompt_list should be in params.")
+                    if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                        print(f"mengyao_debug prefix_prompt_list should be in params.")
                 ##mengyao_debug 这里的意思是prompt_prefix_with_command 匹配radix cache，prompt_result匹配 fusionrag
                 prefix_prompt_ = obj.fusionrag_params["prefix_prompt"]
                 prompt_ = input_text
@@ -884,7 +888,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     # if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"mengyao_debug recompute_idx = {obj.fusionrag_params['recompute_idx']}")
 
-                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                     if 'recompute_idx' in obj.fusionrag_params:
                         print(f"recompute_idx={obj.fusionrag_params['recompute_idx']}")
             # For audio-only requests (e.g., Whisper), text may be empty.

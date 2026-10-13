@@ -286,7 +286,7 @@ class DeepseekMHAForwardMixin:
                 kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
                 if self.layer_id == 0:
                     # torch.set_printoptions(threshold=10000)
-                    if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                    if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                         print(f"mengyao_debug kv_indice={kv_indices}, shape={kv_indices.shape}")
                         print(f"mengyao_debug positions={positions}, shape={positions.shape}")
                         print(f"mengyao_debug out_cache_loc={forward_batch.out_cache_loc}, shape={forward_batch.out_cache_loc.shape}")

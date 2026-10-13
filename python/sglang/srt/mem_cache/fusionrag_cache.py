@@ -74,7 +74,7 @@ class ChunkNode:
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
-        self.host_ref_counter = 0 ##fixme: 按理说不需要，因为永远不会被从host释放
+        self.host_ref_counter = 1 ## mengyao_debug 创建的时候就必须要+1，因为创建就意味着马上要使用，这时候就不能释放了
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
@@ -472,6 +472,7 @@ class FusionragCache(RadixCache):
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
         else:
+            raise "can't have enough host value!"
             return 0
 
         return len(host_indices)
@@ -569,6 +570,8 @@ class FusionragCache(RadixCache):
         Evict host cache nodes with host_ref_counter == 0,
         preferring nodes with the lowest hit_count.
         """
+        print(
+            f"[fusionrag cache] needs {num_tokens} tokens, current available size={self.cache_controller.mem_pool_host.available_size()}")
         tokens_freed = 0
 
         # 只选择可以被 eviction 的 node，并按照 hit_count 从小到大排序
@@ -577,6 +580,8 @@ class FusionragCache(RadixCache):
             if node.host_ref_counter == 0 and node.host_value is not None
         ]
         evictable_nodes.sort(key=lambda node: node.hit_count)
+        for node in self.all_nodes:
+            print(f"node host_ref_counter {node.host_ref_counter} node text={node.text_without_prefix[:30]}")
 
         for node in evictable_nodes:
             if tokens_freed >= num_tokens:
@@ -587,6 +592,7 @@ class FusionragCache(RadixCache):
 
             # 从 all_nodes 中移除
             self.all_nodes.remove(node)
+        print(f"[fusionrag cache] evict_host {num_tokens} tokens, available size={self.cache_controller.mem_pool_host.available_size()}")
 
         return tokens_freed
 
@@ -596,10 +602,10 @@ class FusionragCache(RadixCache):
         mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor, list[torch.Tensor]]:
         # todo: more loading policies
-        print(f"nodes_to_load len = {len(nodes_to_load)}")
+        # print(f"nodes_to_load len = {len(nodes_to_load)}")
 
         start_time = time.perf_counter()
-        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+        if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
             for n in nodes_to_load:
                 print(f"[load_back] text_without_prefix={n.text_without_prefix[:30]}, host_value={n.host_value}")
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
@@ -669,6 +675,7 @@ class FusionragCache(RadixCache):
                     prefix_text = params.key.prefix_prompt_text
                     text_without_prefix = params.key.origin_input_text[len(prefix_text):]
                     if text_without_prefix == node.text_without_prefix:
+                        node.host_ref_counter += 1 ## mengyao_debug 匹配到了说明马上要用了，这时候就不能再释放了.
                         if os.environ.get("DEBUG", "0") != "0":
                             print(f"kv gen already run before\ntext={text_without_prefix}\n"
                               f"prefix={prefix_text}\n"
@@ -715,9 +722,9 @@ class FusionragCache(RadixCache):
                     if len(node.text_without_prefix) > 5 and input_text.startswith(node.text_without_prefix):
                         host_hit_length += len(node.host_value)
                         all_hit_chunk_nodes.append(node)
-                        node.host_ref_counter += 1
+                        # node.host_ref_counter += 1  ##mengyao_debug 我们不能等到用的时候再加，因为如果再创建raw cache阶段申请cache的时候cache不够，就需要释放cache，这时候有可能把这次请求需要的cache给释放了。
                         node.hit_count += 1
-                        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                        if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                             print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
                             print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
                             print(f"host_value={len(node.host_value)}")
@@ -762,7 +769,8 @@ class FusionragCache(RadixCache):
             node = ChunkNode()
             ## 不存储prefix部分
             node.text_without_prefix = key.origin_input_text[len(key.prefix_prompt_text):]
-            print(f"text_without_prefix = {node.text_without_prefix[:30]}")
+            if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                print(f"text_without_prefix = {node.text_without_prefix[:30]}")
             node.prefix_text = key.prefix_prompt_text
             node.values = [value]
             node.priority = priority
@@ -833,7 +841,7 @@ class FusionragCache(RadixCache):
         if req.is_kv_gen and req.save_preprocess_cache:
             print(f"save preprocess cache") ## for debug
         ## todo: 需要验证一下如果带了生成（max_token!=0）的话，要存哪些 kv_indices 是什么
-        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+        if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
             logger.error(
                 f"fusionrag cache_finished_req: rid={req.rid} "
                 f"is_kv_gen={req.is_kv_gen} save_raw_cache={req.save_raw_cache} "
@@ -858,9 +866,10 @@ class FusionragCache(RadixCache):
             kv_prefix_len = req.kv_gen_prefix_len ## this is right
             text_without_prefix_ids = req.origin_input_ids[kv_prefix_len:]
             assert len(text_without_prefix_ids) == len(values) - kv_prefix_len
-            print(f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
-                  f"values={len(values)}\n"
-                  f"kv_prefix_len={kv_prefix_len}\n")
+            if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                print(f"saving to cache, text_without_prefix_ids={len(text_without_prefix_ids)}\n"
+                      f"values={len(values)}\n"
+                      f"kv_prefix_len={kv_prefix_len}\n")
             self.insert(
                 radix_key,
                 values[kv_prefix_len:], ## 不存储prefix部分
@@ -891,7 +900,9 @@ class FusionragCache(RadixCache):
 
         for node_idx, node in enumerate(req.hit_chunk_nodes):
             value_to_remove = req.hit_chunk_values[node_idx].value
-            node.host_ref_counter -= 1
+            if not req.is_kv_gen: ##mengyao_debug kv gen前面是system prompt，永远不能释放
+                if node.host_ref_counter > 0:
+                    node.host_ref_counter -= 1
             try:
                 for value_idx, value in enumerate(node.values):
                     if torch.equal(value, value_to_remove):  # 比较内容是否完全一致

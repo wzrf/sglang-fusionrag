@@ -535,7 +535,7 @@ class Req(ReqDllmMixin):
         )
         self.origin_input_ids = origin_input_ids
 
-        if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+        if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
             print(f"origin_input_ids={len(origin_input_ids)}")
         # Each decode stage's output ids
         self.output_ids = []
@@ -1007,7 +1007,7 @@ class Req(ReqDllmMixin):
             self.host_hit_length = match_result.host_hit_length
             self.prefix_indices = match_result.device_indices  ## empty
             if match_result.no_need_to_run:
-                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"req doesn't need to be run.")
                 self.no_need_to_run = True
         else:
@@ -1623,7 +1623,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             recompute_cache_indices.append(r.prefix_indices[r.recompute_idx]) ##todo mengyao_debug: check this
             r.all_compute_idx = copy.deepcopy(r.recompute_idx)
             extend_compute_idx = [i for i in range(len(r.prefix_indices), len(r.fill_ids))]
-            if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+            if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                 print(f"r.prefix_indices len = {len(r.prefix_indices)}\n r.fill_ids len = {len(r.fill_ids)}")
             r.all_compute_idx.extend(extend_compute_idx)
             ## mengyao_debug: just in case it overlaps
@@ -1634,7 +1634,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 print(f"mengyao_debug This is a DECODER TASK")
             if r.host_hit_length_fusionrag >0:
                 r.recomputation_rate = len(r.recompute_idx) / r.host_hit_length_fusionrag
-                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"mengyao_debug recompute percentage="
                           f"{len(r.recompute_idx) / r.host_hit_length_fusionrag * 100:.2f}%\n prefix length={r.host_hit_length_fusionrag}")
                     # torch.set_printoptions(threshold=10000)
@@ -1798,7 +1798,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"req.origin_input_ids={len(req.origin_input_ids)}")
                     print(f"req.logprob_start_len={req.logprob_start_len}")
                     print(f"req.fill_ids={len(req.fill_ids)}")

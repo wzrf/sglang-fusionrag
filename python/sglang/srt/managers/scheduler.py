@@ -1651,7 +1651,7 @@ class Scheduler(
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-                if os.environ.get("DBEUG_PRINT", "").lower() in ["true", "1"]:
+                if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
                     print(f"{req.rid} is prefill only, logprob_start_len={req.logprob_start_len}")
             else:
                 # If return_logprob is False, only the last token requires logprob computation
