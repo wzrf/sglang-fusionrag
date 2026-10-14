@@ -568,6 +568,7 @@ class Req(ReqDllmMixin):
             ## 3. is_kv_gen=False, load_preprocess_cache=False, 和raw_cache decode请求一样，去raw cache 匹配
             ## 3. is_kv_gen=False, load_preprocess_cache=True, 去preprocess cache 匹配
             self.is_kv_gen = fusionrag_params.get("save_cache", False)
+            self.clear_cache = fusionrag_params.get("clear_cache", False)
             self.kv_gen_use_radix_prefix = fusionrag_params.get("kv_gen_use_radix_prefix", False)
             self.prefix_prompt = fusionrag_params.get("prefix_prompt", "")
             self.save_preprocess_cache = fusionrag_params.get("save_preprocess_cache", False)
@@ -580,6 +581,7 @@ class Req(ReqDllmMixin):
             self.use_preprocess_cache = fusionrag_params.get("load_preprocess_cache", False)
             self.prompt_ids_list = fusionrag_params.get("prompt_ids_list", [])
             self.prefix_prompt_ids_list = fusionrag_params.get("prefix_prompt_ids_list", [])
+            self.prefix_prompt_list = fusionrag_params.get("prefix_prompt_list", [])
             self.kv_gen_prefix_len = len(fusionrag_params.get("prefix_prompt_ids", []))
             self.prefix_cache_ids = fusionrag_params.get("prefix_cache_ids", [])
             #如果是一个preprocess的kv gen请求，那么use_preprocess_cache一定是false.
@@ -588,6 +590,7 @@ class Req(ReqDllmMixin):
             fusionrag_params = None
         else:
             self.is_kv_gen = False
+            self.clear_cache = False
             self.kv_gen_use_radix_prefix = False
             self.kv_gen_prefix_len = 0
             self.prefix_prompt = ""
@@ -600,6 +603,7 @@ class Req(ReqDllmMixin):
             self.recompute_idx = []
             self.prompt_ids_list = []
             self.prefix_prompt_ids_list = []
+            self.prefix_prompt_list = []
         # shm debug
         # self.is_kv_gen = True
 
@@ -1024,7 +1028,8 @@ class Req(ReqDllmMixin):
                                  is_kv_gen=self.is_kv_gen,
                                  is_preprocess_kv_gen=self.save_preprocess_cache,
                                  use_preprocess_kv_cache=self.use_preprocess_cache,
-                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list
+                                 prefix_prompt_ids_list=self.prefix_prompt_ids_list,
+                                 prefix_prompt_list=self.prefix_prompt_list,
                                  ),
                     req=self if tree_cache_hicache.supports_mamba() else None,
                     cow_mamba=tree_cache_hicache.supports_mamba(),

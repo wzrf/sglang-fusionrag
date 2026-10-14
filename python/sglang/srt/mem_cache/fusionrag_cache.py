@@ -46,6 +46,9 @@ from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
+import hashlib
+
+
 class HitCacheNode:
     def __init__(
         self,
@@ -99,6 +102,10 @@ class ChunkNode:
     def protect_host(self):
         """Protect the host value from eviction."""
         self.host_ref_counter += 1
+
+    def hash_key(self) -> str:
+        text = f"is_preprocess_cache={self.is_preprocess_cache} text_without_prefix={self.text_without_prefix}"
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def release_host(self):
         """Release the host value, allowing it to be evicted."""
@@ -239,6 +246,7 @@ class FusionragCache(RadixCache):
         )
         self.load_back_threshold = 10
         self.all_nodes: List[ChunkNode] = []
+        self.key_to_nodes = {}
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.eviction_policy = "lru" ## mengyao_debug
@@ -365,6 +373,7 @@ class FusionragCache(RadixCache):
                 node.text_without_prefix_ids = text_without_prefix_ids
                 node.preprocess_cache_key = preprocess_cache_key
                 self.all_nodes.append(node)
+                self.key_to_nodes[node.hash_key()] = node
             except Exception as e:
                 print(f"unsupport layout detected. e={e}, chunk_cache={all_chunk_cache}")
 
@@ -429,6 +438,8 @@ class FusionragCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.all_nodes.clear()
+        self.key_to_nodes.clear()
 
     def get_height(self, node):
         return 0
@@ -579,9 +590,10 @@ class FusionragCache(RadixCache):
             node for node in self.all_nodes
             if node.host_ref_counter == 0 and node.host_value is not None
         ]
+        print(f"evictable_nodes length={len(evictable_nodes)}")
         evictable_nodes.sort(key=lambda node: node.hit_count)
-        for node in self.all_nodes:
-            print(f"node host_ref_counter {node.host_ref_counter} node text={node.text_without_prefix[:30]}")
+        # for node in self.all_nodes:
+        #     print(f"node host_ref_counter {node.host_ref_counter} node text={node.text_without_prefix[:30]}")
 
         for node in evictable_nodes:
             if tokens_freed >= num_tokens:
@@ -591,8 +603,9 @@ class FusionragCache(RadixCache):
             tokens_freed += len(node.host_value)
 
             # 从 all_nodes 中移除
+            del self.key_to_nodes[node.hash_key()]
             self.all_nodes.remove(node)
-        print(f"[fusionrag cache] evict_host {num_tokens} tokens, available size={self.cache_controller.mem_pool_host.available_size()}")
+        print(f"[fusionrag cache] evict_host {num_tokens} tokens, current nodes = {len(self.all_nodes)} available size={self.cache_controller.mem_pool_host.available_size()}")
 
         return tokens_freed
 
@@ -704,41 +717,54 @@ class FusionragCache(RadixCache):
             print(f"use preprocess cache") ## for debug
         preprocess_cache_key_list = params.key.preprocess_cache_key_list
         cache_is_preprocess_list = params.key.cache_is_preprocess_list
-        while len(input_text) > 0 and last_round_found:
-            last_round_found = False
-            if cache_is_preprocess_list is None:
-                use_preprocess_kv_cache = params.key.use_preprocess_kv_cache
-            else:
-                use_preprocess_kv_cache = cache_is_preprocess_list[match_idx]
-            for node in self.all_nodes:
-                ## 找到和preprocess/raw 匹配的nodes
-                if node.is_preprocess_cache == use_preprocess_kv_cache:
-                    ##fixme: 在preprocess下可能有多个副本，首先判断对应的preprocess_cache_key是不是skip，如果不是的话需要检查
-                    ## cache的preprocess_cache_key和preprocess_cache_key_list[match_idx]是否相同，不同则跳过；
-                    if use_preprocess_kv_cache:
-                        if preprocess_cache_key_list is not None and preprocess_cache_key_list[match_idx] != "skip":
-                            if node.preprocess_cache_key != params.key.preprocess_cache_key_list[match_idx]:
-                                continue
-                    if len(node.text_without_prefix) > 5 and input_text.startswith(node.text_without_prefix):
-                        host_hit_length += len(node.host_value)
-                        all_hit_chunk_nodes.append(node)
-                        # node.host_ref_counter += 1  ##mengyao_debug 我们不能等到用的时候再加，因为如果再创建raw cache阶段申请cache的时候cache不够，就需要释放cache，这时候有可能把这次请求需要的cache给释放了。
-                        node.hit_count += 1
-                        if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
-                            print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
-                            print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
-                            print(f"host_value={len(node.host_value)}")
-                            if node.preprocess_cache_key != "":
-                                print(f"match_idx={match_idx} preprocess_cache_key={node.preprocess_cache_key}")
-                            try:
-                                print(f"match_idx={match_idx} prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
-                            except Exception as e:
-                                print(f"match_idx={match_idx}")
-                                print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
-                        input_text = input_text[len(node.text_without_prefix) :]
-                        last_round_found = True
-                        break
-            match_idx += 1
+        if cache_is_preprocess_list is None:
+            use_preprocess_kv_cache = params.key.use_preprocess_kv_cache
+        else:
+            use_preprocess_kv_cache = cache_is_preprocess_list[match_idx]
+        if use_preprocess_kv_cache or params.key.prefix_prompt_list in [[], None]: ## 如果prefix_prompt_list为空的话，还是默认匹配字符串
+            while len(input_text) > 0 and last_round_found:
+                last_round_found = False
+                for node in self.all_nodes:
+                    ## 找到和preprocess/raw 匹配的nodes
+                    if node.is_preprocess_cache == use_preprocess_kv_cache:
+                        ##fixme: 在preprocess下可能有多个副本，首先判断对应的preprocess_cache_key是不是skip，如果不是的话需要检查
+                        ## cache的preprocess_cache_key和preprocess_cache_key_list[match_idx]是否相同，不同则跳过；
+                        if use_preprocess_kv_cache:
+                            if preprocess_cache_key_list is not None and preprocess_cache_key_list[match_idx] != "skip":
+                                if node.preprocess_cache_key != params.key.preprocess_cache_key_list[match_idx]:
+                                    continue
+                        if len(node.text_without_prefix) > 5 and input_text.startswith(node.text_without_prefix):
+                            host_hit_length += len(node.host_value)
+                            all_hit_chunk_nodes.append(node)
+                            # node.host_ref_counter += 1  ##mengyao_debug 我们不能等到用的时候再加，因为如果再创建raw cache阶段申请cache的时候cache不够，就需要释放cache，这时候有可能把这次请求需要的cache给释放了。
+                            node.hit_count += 1
+                            if os.environ.get("DEBUG_PRINT", "").lower() in ["true", "1"]:
+                                print(f"match_idx={match_idx} load text: {node.text_without_prefix[:10]}......, preprocess={node.is_preprocess_cache}, save_kv_cache={params.key.is_kv_gen}")
+                                print(f"text_without_prefix_ids={len(node.text_without_prefix_ids)}")
+                                print(f"host_value={len(node.host_value)}")
+                                if node.preprocess_cache_key != "":
+                                    print(f"match_idx={match_idx} preprocess_cache_key={node.preprocess_cache_key}")
+                                try:
+                                    print(f"match_idx={match_idx} prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list[match_idx])}")
+                                except Exception as e:
+                                    print(f"match_idx={match_idx}")
+                                    print(f"prefix_prompt_ids_list={len(params.key.prefix_prompt_ids_list)}")
+                            input_text = input_text[len(node.text_without_prefix) :]
+                            last_round_found = True
+                            break
+                match_idx += 1
+        else:
+            for prefix_text_ in params.key.prefix_prompt_list:
+                text = f"is_preprocess_cache={use_preprocess_kv_cache} text_without_prefix={prefix_text_}"
+                hash_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if hash_key in self.key_to_nodes:
+                    node = self.key_to_nodes[hash_key]
+                    host_hit_length += len(node.host_value)
+                    all_hit_chunk_nodes.append(node)
+                    node.hit_count += 1
+                else:
+                    break
+
 
         return MatchResult(
             device_indices=torch.empty(
@@ -786,6 +812,7 @@ class FusionragCache(RadixCache):
             self.all_nodes.insert(pos, node)
             ## 把数据写回主存里
             self.write_backup(node)
+            self.key_to_nodes[node.hash_key()] = node
             ## 不留显存
             node.values = []
 
@@ -910,6 +937,9 @@ class FusionragCache(RadixCache):
                         break
             except Exception as E:
                 print(f"cache finish req error. E={E}, node={node}")
+
+        if req.clear_cache:
+            self.evict_host(200000) ## mengyao_debug: just give a big number.
 
         # self.req_to_token_pool.free(req) ## this fill be freed in release_kv_cache(
 

@@ -810,6 +810,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
                 if "prefix_prompt_list" in obj.fusionrag_params:
                     prefix_prompt_list = obj.fusionrag_params["prefix_prompt_list"]
+                    obj.fusionrag_params["prefix_prompt_list"] = prefix_prompt_list
                     prefix_prompt_ids_list = []
                     for prefix_prompt in prefix_prompt_list:
                         prefix_prompt_id, _ = await self._tokenize_texts(

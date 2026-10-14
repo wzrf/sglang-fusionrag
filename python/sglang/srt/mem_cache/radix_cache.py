@@ -79,6 +79,7 @@ class RadixKey:
         preprocess_cache_key: str = "",
         preprocess_cache_key_list: list[str] = None,
         cache_is_preprocess_list: list[bool] = None,
+        prefix_prompt_list: list[str] = None,
     ):
         # token ids sequence
         self.token_ids = token_ids
@@ -88,6 +89,7 @@ class RadixKey:
         self.is_bigram = is_bigram
         self.origin_input_text = origin_input_text
         self.prefix_prompt_text = prefix_prompt_text
+        self.prefix_prompt_list = prefix_prompt_list
         self.is_kv_gen = is_kv_gen
         self.is_preprocess_kv_gen = is_preprocess_kv_gen ## 生成 preprocess kv cache
         self.use_preprocess_kv_cache = use_preprocess_kv_cache ## 使用 preprocess kv cache
